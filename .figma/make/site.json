@@ -1,0 +1,10 @@
+{
+  "description": "Connects EV drivers in India with nearby homeowners offering charging, with transparent meter-verified billing, UPI payments, and host earnings.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
