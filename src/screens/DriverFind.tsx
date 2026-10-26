@@ -3,15 +3,17 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { AnimatePresence, motion } from "framer-motion"
 import {
   AlertTriangle,
+  Crosshair,
   LocateFixed,
   MapPin,
+  MessageSquare,
   Navigation,
   PlugZap,
   Route,
   Star,
+  UserCheck,
   X,
   Zap,
-  Crosshair,
 } from "lucide-react"
 import {
   SPRING,
@@ -31,7 +33,12 @@ import {
 import { useStore, useToast } from "../store"
 import { Avatar, Btn, Card, Chip, Img, Num, Slider } from "../ui"
 import { createBooking } from "../lib/api"
-import { ACTIVE_STATUSES, refresh } from "../lib/live"
+import {
+  ACTIVE_STATUSES,
+  refresh,
+  useDriverReviews,
+  useHostReviews,
+} from "../lib/live"
 import { useBookingList, useHostList } from "../lib/data"
 import { DEMO_USERS, demoBooking } from "../demo"
 import {
@@ -50,8 +57,6 @@ const FILTERS = [
   ["chai", "☕ Free Chai", (h) => h.perks.includes("Free Chai")],
 ]
 
-// Without a shared location there's no distance: km/mins stay null and the
-// list keeps the server's order.
 function useNearby() {
   const { state } = useStore()
   const { user, hosts } = state
@@ -69,14 +74,13 @@ function useNearby() {
 }
 const distText = (h) =>
   h.km == null ? "Distance unknown" : `${h.km.toFixed(1)} km • ${h.mins} mins`
-const ratingText = (h) =>
-  Number.isFinite(h.rating) && h.reviews > 0
+const ratingText = (h, liveCount, liveAvg) => {
+  if (liveCount > 0 && liveAvg != null) return `${liveAvg} (${liveCount})`
+  return Number.isFinite(h.rating) && h.reviews > 0
     ? `${h.rating.toFixed(1)} (${h.reviews})`
     : "New"
-// India-wide view when there's nothing better to centre on
+}
 const INDIA = [22.5, 79]
-
-// host names are user input and go into Leaflet's HTML popups
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)
 
 function NoMedia() {
@@ -93,7 +97,6 @@ function NoMedia() {
   )
 }
 
-// The host's own uploaded photo or walkthrough video, or an honest placeholder.
 export function VideoPreview({ host }) {
   const ref = useRef(null)
   const [err, setErr] = useState(false)
@@ -117,7 +120,9 @@ export function VideoPreview({ host }) {
   const src =
     (media &&
       (isVideo ? cldVideo(media) : photoUrl(media, { w: 640, h: 360 }))) ||
-    host.mediaUrl
+    host.mediaUrl ||
+    host.photo ||
+    host.photoUrl
   if (!src || err) return <NoMedia />
   if (!isVideo)
     return (
@@ -146,6 +151,18 @@ export function VideoPreview({ host }) {
 
 function HostCard({ h, selected, best, onSelect, onCharge }) {
   const { state } = useStore()
+  const demo = Boolean(state.session.demo)
+  const { reviews: hostReviews } = useHostReviews(h.id, !demo)
+  const liveCount = hostReviews.length
+  const liveAvg =
+    liveCount > 0
+      ? (
+          hostReviews.reduce((sum, r) => sum + (Number(r.stars) || 5), 0) /
+          liveCount
+        ).toFixed(1)
+      : null
+  const latestReview = hostReviews[0] || null
+
   return (
     <motion.div
       layout
@@ -219,7 +236,7 @@ function HostCard({ h, selected, best, onSelect, onCharge }) {
               <p className="text-sm text-slate flex flex-wrap items-center gap-x-2">
                 <span className="inline-flex items-center gap-1">
                   <Star size={13} className="fill-amber text-amber" />
-                  {ratingText(h)}
+                  {ratingText(h, liveCount, liveAvg)}
                 </span>
                 ·
                 <span>
@@ -229,6 +246,24 @@ function HostCard({ h, selected, best, onSelect, onCharge }) {
               </p>
             </div>
           </div>
+
+          {/* Real-Time Latest Driver Review on Charger Card */}
+          {latestReview && (
+            <div className="mt-3 rounded-xl bg-mint/70 border border-line/60 px-3 py-2 text-xs">
+              <div className="flex items-center justify-between text-[11px] font-bold text-ink">
+                <span className="truncate">💬 {latestReview.driverName}</span>
+                <span className="text-amber font-mono">
+                  {"★".repeat(latestReview.stars)}
+                </span>
+              </div>
+              {latestReview.comment && (
+                <p className="text-slate truncate mt-0.5">
+                  “{latestReview.comment}”
+                </p>
+              )}
+            </div>
+          )}
+
           <div className="mt-3 flex flex-wrap gap-1.5">
             {h.perks.slice(0, 4).map((p) => (
               <span
@@ -302,13 +337,10 @@ function MapView({ hosts, onSelect, onCharge }) {
         else if (first) m.setView([first.lat, first.lng], 13)
         else m.setView(INDIA, 5)
         L.control.zoom({ position: "bottomleft" }).addTo(m)
-        L.tileLayer(
-          "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-          {
-            maxZoom: 19,
-            attribution: "&copy; OpenStreetMap contributors",
-          },
-        ).addTo(m)
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          maxZoom: 19,
+          attribution: "&copy; OpenStreetMap contributors",
+        }).addTo(m)
         map.current = m
         setStatus("ready")
         setTimeout(() => m.invalidateSize(), 60)
@@ -622,6 +654,33 @@ export function BookingSheet({ host, onClose }) {
   const ref = useRef(null)
   const err = useErrorToast()
   const [busy, setBusy] = useState(false)
+
+  // 100% Real-Time Reviews for Host & Driver (from Supabase RLS / Backend Server)
+  const { reviews: hostReviews, loading: reviewsLoading } = useHostReviews(
+    host.id,
+    !demo,
+  )
+  const { reviews: myDriverReviews } = useDriverReviews(
+    state.session.userId,
+    !demo,
+  )
+  const myDriverAvg =
+    myDriverReviews.length > 0
+      ? (
+          myDriverReviews.reduce((s, r) => s + r.stars, 0) /
+          myDriverReviews.length
+        ).toFixed(1)
+      : null
+
+  const liveHostAvg =
+    hostReviews.length > 0
+      ? (
+          hostReviews.reduce((s, r) => s + r.stars, 0) / hostReviews.length
+        ).toFixed(1)
+      : Number.isFinite(host.rating) && host.reviews > 0
+        ? host.rating.toFixed(1)
+        : null
+
   useEffect(() => {
     const prev = document.activeElement
     ref.current?.querySelector("input")?.focus()
@@ -644,6 +703,7 @@ export function BookingSheet({ host, onClose }) {
       prev?.focus?.()
     }
   }, [])
+
   const away = host.mins != null ? `${host.mins} mins away · ` : ""
   const confirmDemo = () => {
     const active = bookings.find(
@@ -682,6 +742,7 @@ export function BookingSheet({ host, onClose }) {
     onClose()
     dispatch({ type: "TAB", role: "driver", tab: "charge" })
   }
+
   const confirm = async () => {
     if (busy) return
     if (demo) return confirmDemo()
@@ -703,6 +764,7 @@ export function BookingSheet({ host, onClose }) {
       err("Couldn't book this charger", e)
     }
   }
+
   const rows = [
     ["Energy needed", <Num value={kwh} decimals={1} suffix=" kWh" />],
     [
@@ -725,6 +787,7 @@ export function BookingSheet({ host, onClose }) {
       </span>,
     ],
   ]
+
   return (
     <motion.div
       className="fixed inset-0 z-[900] flex items-end md:items-center justify-center"
@@ -749,6 +812,20 @@ export function BookingSheet({ host, onClose }) {
       >
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-1.5 mb-1.5">
+              <span className="h-6 px-2.5 rounded-full bg-amber/20 text-ink text-xs font-mono font-bold inline-flex items-center gap-1">
+                <Star size={12} className="fill-amber text-amber" />
+                {liveHostAvg
+                  ? `${liveHostAvg} (${hostReviews.length || host.reviews} reviews)`
+                  : "New Host"}
+              </span>
+              <span className="h-6 px-2.5 rounded-full bg-mint text-parrot-ink text-xs font-semibold inline-flex items-center gap-1">
+                <UserCheck size={12} />
+                {myDriverAvg
+                  ? `Your Driver Rating: ★ ${myDriverAvg} (${myDriverReviews.length})`
+                  : "Your Profile: Verified Driver"}
+              </span>
+            </div>
             <h3 className="font-display text-xl font-extrabold">{host.name}</h3>
             <p className="text-sm text-slate font-mono">
               {distText(host)} · {host.socket}
@@ -762,7 +839,47 @@ export function BookingSheet({ host, onClose }) {
             <X size={18} />
           </button>
         </div>
-        <div className="mt-6">
+
+        {/* REAL-TIME HOST REVIEWS SECTION BEFORE BOOKING */}
+        <div className="mt-4 rounded-2xl bg-mint/60 border border-line p-3.5 space-y-2">
+          <div className="flex items-center justify-between text-xs font-bold text-ink">
+            <span className="flex items-center gap-1.5 text-parrot-ink">
+              <MessageSquare size={14} /> Real-Time Driver Reviews
+            </span>
+            <span className="font-mono text-slate">
+              {hostReviews.length} {hostReviews.length === 1 ? "review" : "reviews"}
+            </span>
+          </div>
+          {reviewsLoading ? (
+            <p className="text-xs text-slate py-2">Loading live reviews…</p>
+          ) : hostReviews.length === 0 ? (
+            <p className="text-xs text-slate py-1">
+              No reviews yet for {host.name}. Complete a charge to leave the
+              first verified review!
+            </p>
+          ) : (
+            <div className="space-y-2 max-h-32 overflow-y-auto pr-1">
+              {hostReviews.map((r) => (
+                <div
+                  key={r.id}
+                  className="rounded-xl bg-white p-2.5 border border-line/70 text-xs"
+                >
+                  <div className="flex items-center justify-between font-bold text-ink">
+                    <span>{r.driverName}</span>
+                    <span className="text-amber font-mono">
+                      {"★".repeat(r.stars)}
+                    </span>
+                  </div>
+                  {r.comment && (
+                    <p className="text-slate mt-0.5">“{r.comment}”</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="mt-5">
           <div className="flex justify-between text-sm">
             <span className="font-medium">Target battery</span>
             <span className="font-mono font-bold">
@@ -855,7 +972,6 @@ export default function DriverFind() {
   const openSheet = (hOrId) =>
     setSheetId(typeof hOrId === "string" ? hOrId : hOrId.id)
 
-  // Robust location detection with Browser GPS + IP Geolocation Fallback
   const detect = async () => {
     if (demo)
       return toast(
@@ -882,46 +998,59 @@ export default function DriverFind() {
       } catch {}
     }
 
-    // Try Browser GPS first
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
-        (g) => applyLocation(g.coords.latitude, g.coords.longitude, "GPS Location"),
+        (g) =>
+          applyLocation(
+            g.coords.latitude,
+            g.coords.longitude,
+            "GPS Location",
+          ),
         async () => {
-          // Fallback to IP Geolocation if GPS fails or is blocked in iframe/preview
           try {
             const res = await fetch("https://ipapi.co/json/")
             const data = await res.json()
             if (data && data.latitude && data.longitude) {
-              applyLocation(data.latitude, data.longitude, data.city || "Current City")
-            } else {
-              throw new Error("IP fallback failed")
+              applyLocation(
+                data.latitude,
+                data.longitude,
+                data.city || "Current Location",
+              )
+              return
             }
+            throw new Error()
           } catch {
-            setScanning(false)
-            toast(
-              "Couldn't get your location",
-              "Allow location access and try again. Chargers are still bookable from the list.",
-              { tone: "warn" },
-            )
+            try {
+              const res2 = await fetch("https://ipwho.is/")
+              const data2 = await res2.json()
+              if (data2 && data2.success && data2.latitude && data2.longitude) {
+                applyLocation(
+                  data2.latitude,
+                  data2.longitude,
+                  data2.city || "Current Location",
+                )
+                return
+              }
+              throw new Error()
+            } catch {
+              setScanning(false)
+              toast(
+                "Couldn't get your location",
+                "Allow location access and try again. Chargers are still bookable from the list.",
+                { tone: "warn" },
+              )
+            }
           }
         },
-        { timeout: 7000, enableHighAccuracy: true },
+        { timeout: 6000, enableHighAccuracy: false },
       )
     } else {
-      // Direct IP fallback if Geolocation not supported
-      try {
-        const res = await fetch("https://ipapi.co/json/")
-        const data = await res.json()
-        if (data && data.latitude && data.longitude) {
-          applyLocation(data.latitude, data.longitude, data.city || "Current City")
-        } else {
-          setScanning(false)
-          toast("Location unavailable", "Could not detect location.", { tone: "warn" })
-        }
-      } catch {
-        setScanning(false)
-        toast("Location unavailable", "Could not detect location.", { tone: "warn" })
-      }
+      setScanning(false)
+      toast(
+        "Location unavailable",
+        "This browser can't share GPS — chargers are listed without distances.",
+        { tone: "warn" },
+      )
     }
   }
 
@@ -951,7 +1080,7 @@ export default function DriverFind() {
                 {user.simulated
                   ? "Simulated location · judge demo"
                   : hasLoc(user)
-                    ? "Active location"
+                    ? "GPS location"
                     : "Detect your location to sort chargers by distance"}
               </p>
             </div>

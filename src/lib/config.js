@@ -1,6 +1,3 @@
-// Public live-mode configuration. Only public values live here: the Supabase
-// URL + anon key (env first, then the Figma Make connection) and the
-// Cloudinary cloud name. Privileged keys stay on the edge function.
 import { projectId, publicAnonKey } from "../../utils/supabase/info"
 
 const env = import.meta.env

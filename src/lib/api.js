@@ -1,5 +1,5 @@
 import { ApiError, request } from "./config"
-import { getToken } from "./supabase"
+import { getToken, supabase } from "./supabase"
 
 const HOST_PHOTO_CACHE_KEY = "plughome:host_photos"
 
@@ -50,75 +50,124 @@ export const fetchReadings = (bookingId) =>
 export const fetchStats = () => authed("/stats")
 export const fetchReviews = (hostId) =>
   request(`/hosts/${encodeURIComponent(hostId)}/reviews`)
+export const fetchDriverReviews = (driverId) =>
+  request(`/drivers/${encodeURIComponent(driverId)}/reviews`)
+export const fetchMyProfile = () => authed("/auth/profile")
+export const saveMyProfile = (profileData) =>
+  post("/auth/profile", profileData)
 
-// actions — the server decides status, kWh and money; callers only ask
+// actions
 export const createBooking = (hostId, startSoc, targetSoc) =>
-  post("/bookings", { hostId, startSoc, targetSoc })
-// "mark_paid" = the driver confirms they paid the host directly; no silent
-// retry under another action name, so a server mismatch surfaces as an error
+  post("/bookings", {
+    hostId: String(hostId),
+    startSoc: Math.round(Number(startSoc) || 0),
+    targetSoc: Math.round(Number(targetSoc) || 85),
+  })
 export const bookingAction = (bookingId, action) =>
   post(`/bookings/${encodeURIComponent(bookingId)}/action`, { action })
 export const confirmReading = (bookingId, stage, value) =>
   post(`/bookings/${encodeURIComponent(bookingId)}/readings/${stage}/confirm`, {
-    value,
+    value: Number(value),
   })
-
-// Preserves photo/photoUrl/img/image/photos when listing a socket
-export const listMySocket = async (payload) => {
-  const {
+export const listMySocket = ({
+  name,
+  locality,
+  rate,
+  socket,
+  perks,
+  lat,
+  lng,
+}) =>
+  post("/hosts", {
     name,
     locality,
-    rate,
+    rate: Math.round(Number(rate) || 12),
     socket,
     perks,
-    lat,
-    lng,
-    photo,
-    photoUrl,
-    img,
-    image,
-    photos,
-    ...rest
-  } = payload || {}
-
-  const resolvedPhoto =
-    photo || photoUrl || img || image || (Array.isArray(photos) ? photos[0] : null)
-
-  if (resolvedPhoto && name) {
-    saveHostPhotoCache(`${name.trim().toLowerCase()}|${(locality || "").trim().toLowerCase()}`, resolvedPhoto)
-    saveHostPhotoCache(name.trim().toLowerCase(), resolvedPhoto)
-  }
-
-  const res = await post("/hosts", {
-    name,
-    locality,
-    rate,
-    socket,
-    perks,
-    lat,
-    lng,
-    photo: resolvedPhoto,
-    photoUrl: resolvedPhoto,
-    img: resolvedPhoto,
-    image: resolvedPhoto,
-    photos: photos || (resolvedPhoto ? [resolvedPhoto] : undefined),
-    ...rest,
+    lat: Number(lat),
+    lng: Number(lng),
   })
-
-  if (resolvedPhoto && res?.id) {
-    saveHostPhotoCache(res.id, resolvedPhoto)
-  }
-  return res
-}
-
 export const setSocketOnline = (hostId, online) =>
   post(`/hosts/${encodeURIComponent(hostId)}/online`, { online })
 export const removeSocket = (hostId) =>
   authed(`/hosts/${encodeURIComponent(hostId)}`, { method: "DELETE" })
-// the driver rates a paid session once (1-5 stars, optional comment)
-export const reviewBooking = (bookingId, stars, comment = "") =>
-  post(`/bookings/${encodeURIComponent(bookingId)}/review`, { stars, comment })
+
+export const reviewBooking = (
+  bookingId,
+  stars,
+  comment = "",
+  byRole = "driver",
+  tags = [],
+) => {
+  const endpoint =
+    byRole === "host"
+      ? `/bookings/${encodeURIComponent(bookingId)}/driver-review`
+      : `/bookings/${encodeURIComponent(bookingId)}/review`
+  return post(endpoint, {
+    stars: Math.round(Number(stars) || 5),
+    comment,
+    tags,
+  })
+}
+
+export const reviewDriverBooking = (bookingId, stars, comment = "", tags = []) =>
+  post(`/bookings/${encodeURIComponent(bookingId)}/driver-review`, {
+    stars: Math.round(Number(stars) || 5),
+    comment,
+    tags,
+  })
 
 // uploads
 export const signUpload = (params) => post("/uploads/sign", params)
 export const completeUpload = (params) => post("/uploads/complete", params)
+
+// Uploads profile photo to Cloudinary or Supabase Storage via backend /uploads/sign -> /uploads/complete
+export async function uploadAvatar(file, fallbackDataUrl = "") {
+  try {
+    const contentType = file.type || "image/jpeg"
+    const sign = await signUpload({
+      purpose: "avatar",
+      resourceType: "image",
+      contentType,
+      size: file.size,
+    })
+
+    if (sign.provider === "cloudinary") {
+      const fd = new FormData()
+      Object.entries(sign.params || {}).forEach(([k, v]) =>
+        fd.append(k, String(v)),
+      )
+      fd.append("api_key", sign.apiKey)
+      fd.append("signature", sign.signature)
+      fd.append("file", file)
+
+      const up = await fetch(
+        `https://api.cloudinary.com/v1_1/${sign.cloudName}/image/upload`,
+        { method: "POST", body: fd },
+      )
+      if (!up.ok) throw new Error("Cloudinary upload failed")
+    } else if (sign.provider === "supabase" && supabase) {
+      const { error } = await supabase.storage
+        .from(sign.bucket)
+        .uploadToSignedUrl(sign.path, sign.token, file, {
+          contentType,
+          upsert: true,
+        })
+      if (error) throw error
+    }
+
+    const done = await completeUpload({ uploadId: sign.uploadId })
+    if (done?.photoUrl) {
+      return done.photoUrl
+    }
+  } catch (e) {
+    console.warn("Direct media upload fallback to KV profile:", e)
+  }
+
+  // Fallback: save compressed image in backend KV store via /auth/profile
+  if (fallbackDataUrl) {
+    const res = await saveMyProfile({ photoUrl: fallbackDataUrl })
+    return res?.profile?.photoUrl || fallbackDataUrl
+  }
+  throw new ApiError("Couldn't upload profile photo.")
+}

@@ -1,14 +1,4 @@
-// PLUG-HOME edge function. The server is the only authority for booking
-// status, meter readings, kWh, bills and earnings; the browser only asks.
-// Data lives in the Postgres tables from
-// supabase/migrations/20261024100000_plughome_schema.sql (RLS on, no client
-// policies: only this function's service role can read or write them).
-// Media (meter photos, listing photos/videos) goes to Cloudinary when its API
-// secret is set, otherwise to private Supabase Storage buckets this function
-// creates (see supabase/migrations/20261026100000_plughome_storage.sql).
-// Only real users' data is served: no seeded or sample rows reach live mode.
-// Secrets (service role, Cloudinary API secret) are read from the function
-// environment and never returned to clients.
+// PLUG-HOME edge function.
 import { Hono } from "npm:hono"
 import { cors } from "npm:hono/cors"
 import { logger } from "npm:hono/logger"
@@ -18,32 +8,27 @@ import * as kv from "./kv_store.tsx"
 const app = new Hono()
 const P = "/make-server-14a63397"
 
-// Enable logger
 app.use("*", logger(console.log))
 
-// Enable CORS for all routes and methods
 app.use(
   "/*",
   cors({
     origin: "*",
-    allowHeaders: ["Content-Type", "Authorization"],
+    allowHeaders: ["Content-Type", "Authorization", "apikey"],
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     exposeHeaders: ["Content-Length"],
     maxAge: 600,
   }),
 )
 
-// ---------- environment ----------
 const env = (k: string) => (Deno.env.get(k) ?? "").trim()
 const SUPABASE_URL = env("SUPABASE_URL")
 const SERVICE_KEY = env("SUPABASE_SERVICE_ROLE_KEY")
 const db = createClient(SUPABASE_URL, SERVICE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 })
-// read per request so newly added secrets apply without a code change
+
 const cld = () => ({
-  // cloud name and API key are public (every asset URL / signed upload form
-  // carries them), so they have defaults; only the API secret must be set
   cloud: env("CLOUDINARY_CLOUD_NAME") || "kegek3qo",
   key: env("CLOUDINARY_API_KEY") || "147459677335848",
   secret: env("CLOUDINARY_API_SECRET"),
@@ -52,23 +37,17 @@ const cldReady = () => {
   const c = cld()
   return Boolean(c.cloud && c.key && c.secret)
 }
-// Cloudinary's OCR add-on must be enabled on the account before uploads may
-// request it, so it is opt-in (CLOUDINARY_OCR=true). Without it the meter
-// reading is typed in by hand.
 const ocrOn = () => /^(1|true|yes|adv_ocr)$/i.test(env("CLOUDINARY_OCR"))
-// Where uploads go: Cloudinary (signed direct upload, transforms, optional
-// OCR) when its secret is set, else private Supabase Storage buckets.
-// MEDIA_STORAGE=supabase forces Storage even with Cloudinary configured.
 const storageMode = () =>
   env("MEDIA_STORAGE").toLowerCase() === "supabase" || !cldReady()
     ? "supabase"
     : "cloudinary"
 
-const PACK = 26 // kWh, matches the app's battery model
+const PACK = 26
 const DAY = 86400000
-const IST = 19800000 // earnings days roll over at Indian midnight
+const IST = 19800000
 const MB = 1024 * 1024
-// named interfaces: the repo formatter mangles one-line type literals
+
 interface Socket {
   label: string
   kw: number
@@ -86,7 +65,7 @@ interface Bucket {
   id: string
   maxBytes: number
   types: string[]
-  ttl: number // signed download URL lifetime, seconds
+  ttl: number
 }
 interface Signed {
   url: string
@@ -96,6 +75,7 @@ interface Signed {
 const SOCKETS: Record<string, Socket> = {
   "15A Plug": { label: "15A Plug", kw: 3.3 },
   "7.2kW Wallbox": { label: "7.2kW Type-2", kw: 7.2 },
+  "7.2kW Fast": { label: "7.2kW Type-2", kw: 7.2 },
   "11kW AC": { label: "11kW AC", kw: 7.2 },
 }
 const PERKS = ["CCTV", "Family Verified", "Free Chai", "Solar"]
@@ -105,8 +85,6 @@ const ACTIONS = [
   "cancel",
   "arrive",
   "finish_charging",
-  // the driver confirms they paid the host directly (UPI/cash); nothing is
-  // charged or verified here. pay_demo is the legacy name older clients send.
   "mark_paid",
   "pay_demo",
   "recheck",
@@ -142,8 +120,6 @@ const EXT: Record<string, string> = {
   "video/quicktime": "mov",
   "video/webm": "webm",
 }
-// private buckets: no storage.objects policies, so only this function (service
-// role), its single-use signed upload URLs and expiring signed URLs reach them
 const BUCKETS: Record<string, Bucket> = {
   host_media: {
     id: "make-14a63397-host-media",
@@ -156,6 +132,12 @@ const BUCKETS: Record<string, Bucket> = {
     maxBytes: 10 * MB,
     types: IMAGE_TYPES,
     ttl: 86400,
+  },
+  avatar: {
+    id: "make-14a63397-avatars",
+    maxBytes: 10 * MB,
+    types: IMAGE_TYPES,
+    ttl: 30 * 86400,
   },
 }
 const HUMAN: Record<string, string> = {
@@ -171,7 +153,6 @@ const HUMAN: Record<string, string> = {
   disputed: "disputed",
 }
 
-// ---------- errors ----------
 class HttpError extends Error {
   status: number
   constructor(status: number, message: string) {
@@ -196,7 +177,6 @@ const stale = (b: any) =>
     409,
     `This booking is now ${HUMAN[b.status] ?? b.status} — refreshing to the latest state.`,
   )
-// Postgres functions raise SQLSTATE PHxxx where xxx is the HTTP status
 function dbFail(error: any): never {
   const code = String(error?.code ?? "")
   if (/^PH\d{3}$/.test(code)) fail(Number(code.slice(2)), error.message)
@@ -215,7 +195,6 @@ const must = (res: DbResult) => {
   return res.data
 }
 
-// ---------- helpers ----------
 const readBody = async (c: any) => {
   try {
     const b = await c.req.json()
@@ -251,7 +230,9 @@ async function sha1Hex(s: string) {
   ).join("")
 }
 
-// ---------- row -> API shape (camelCase, ms timestamps) ----------
+const cldAvatarUrl = (publicId: string) =>
+  `https://res.cloudinary.com/${cld().cloud}/image/upload/c_fill,g_face,w_256,h_256,f_auto,q_auto/${publicId.split("/").map(encodeURIComponent).join("/")}`
+
 const hostOut = (r: any) => ({
   id: r.id,
   name: r.name,
@@ -266,12 +247,9 @@ const hostOut = (r: any) => ({
   kw: num(r.kw),
   rate: r.rate,
   perks: r.perks ?? [],
-  // the column defaults to 5.0, so an unreviewed listing has no rating yet
   rating: r.reviews > 0 ? num(r.rating) : null,
   reviews: r.reviews,
   online: r.online,
-  // a listing's media is only ever what its owner uploaded (never sample
-  // footage); Storage-backed media also gets a signed mediaUrl (hostsOut)
   mediaPublicId: r.media_public_id,
   mediaType: r.media_type,
   createdAt: r.demo ? 0 : ms(r.created_at),
@@ -316,9 +294,6 @@ const readingOut = (r: any) =>
       }
     : null
 
-// ---------- media storage (Supabase Storage) ----------
-// Storage-backed media is recorded as "sb:<bucket>/<path>" in the same
-// public_id columns Cloudinary ids use, so the schema serves both.
 const SB = "sb:"
 const parseStored = (id: unknown) => {
   const m = /^sb:([^/]+)\/(.+)$/.exec(String(id ?? ""))
@@ -347,11 +322,8 @@ async function ensureBuckets() {
   bucketsReady = true
   return true
 }
-// create the buckets on startup (idempotent); uploads retry if this failed
 ensureBuckets().catch((e) => console.log("Bucket setup error:", e))
 
-// Expiring download URLs for private objects, batched per bucket and reused
-// per isolate until a quarter of their lifetime is left
 const signedCache = new Map<string, Signed>()
 async function signMedia(ids: unknown[]) {
   const out = new Map<string, string>()
@@ -373,7 +345,6 @@ async function signMedia(ids: unknown[]) {
         .createSignedUrls(paths, ttl)
       if (error) return console.log("Signing media URLs failed:", error)
       for (const d of data ?? []) {
-        // a missing object gets no URL: the app shows "no photo" honestly
         if (d.error || !d.signedUrl || !d.path) continue
         const id = `${SB}${bucket}/${d.path}`
         signedCache.set(id, { url: d.signedUrl, exp: now + ttl * 1000, ttl })
@@ -400,7 +371,6 @@ async function readingsOut(rows: any[]) {
   })
 }
 
-// ---------- auth ----------
 async function auth(c: any) {
   const token = c.req.header("Authorization")?.split(" ")[1]
   if (!token) fail(401, "Please log in again.")
@@ -408,24 +378,48 @@ async function auth(c: any) {
   if (error || !data?.user)
     fail(401, "Your session has expired — please log in again.")
   const user = data.user!
-  const row = must(
-    await db
-      .from("profiles")
-      .select("name, role")
-      .eq("id", user.id)
-      .maybeSingle(),
-  )
-  if (row) return { id: user.id, profile: row }
-  // accounts created before the profiles table: backfill from metadata
+  const { data: row } = await db
+    .from("profiles")
+    .select("name, role")
+    .eq("id", user.id)
+    .maybeSingle()
+  if (row) return { id: user.id, email: user.email, profile: row }
   const profile = {
-    name: clean(user.user_metadata?.name, 60) || "PLUG-HOME user",
+    name:
+      clean(user.user_metadata?.name || user.user_metadata?.full_name, 60) ||
+      "PLUG-HOME user",
     role: user.user_metadata?.role === "host" ? "host" : "driver",
   }
-  must(await db.from("profiles").upsert({ id: user.id, ...profile }))
-  return { id: user.id, profile }
+  await db.from("profiles").upsert({ id: user.id, ...profile })
+  return { id: user.id, email: user.email, profile }
 }
 
-// ---------- realtime (Supabase Broadcast over REST) ----------
+// Helper to resolve full user profile (including Cloudinary/Storage avatar & EV/Host details) from KV
+const userProfileKey = (uid: string) => `plughome:user_profile:${uid}`
+async function resolveFullProfile(me: { id: string; email?: string; profile: any }) {
+  const saved = (await kv.get(userProfileKey(me.id)).catch(() => null)) || {}
+  let photoUrl = saved.photoUrl || ""
+  if (saved.avatarPublicId) {
+    if (parseStored(saved.avatarPublicId)) {
+      const signed = await signMedia([saved.avatarPublicId])
+      photoUrl = signed.get(saved.avatarPublicId) || photoUrl
+    } else {
+      photoUrl = cldAvatarUrl(saved.avatarPublicId)
+    }
+  }
+  return {
+    id: me.id,
+    name: saved.name || me.profile.name,
+    role: saved.role || me.profile.role,
+    phone: saved.phone || "",
+    email: saved.email || me.email || "",
+    photoUrl,
+    avatarPublicId: saved.avatarPublicId || null,
+    driverDetails: saved.driverDetails || null,
+    hostDetails: saved.hostDetails || null,
+  }
+}
+
 async function broadcast(messages: Message[]) {
   if (!messages.length) return
   try {
@@ -442,7 +436,6 @@ async function broadcast(messages: Message[]) {
     })
     if (!r.ok) console.log("Broadcast failed:", r.status, await r.text())
   } catch (e) {
-    // clients also poll/refetch, so a missed broadcast only delays the update
     console.log("Broadcast error:", e)
   }
 }
@@ -465,7 +458,6 @@ const hostMsg = (host: any) => ({
   payload: { host },
 })
 
-// ---------- data access ----------
 const getHost = async (id: string) =>
   must(await db.from("hosts").select("*").eq("id", id).maybeSingle()) ??
   fail(404, "That charger no longer exists.")
@@ -490,42 +482,116 @@ const partyOf = (b: any, uid: string) =>
 const asParty = (b: any, uid: string) =>
   partyOf(b, uid) ?? fail(404, "That booking no longer exists.")
 
-// the app won't sign anyone in until /config reports a working database;
-// cache success per isolate
 let dbReady = false
 async function checkDb() {
   if (dbReady) return true
   const { error } = await db.from("hosts").select("id").limit(1)
-  if (error) console.log("Database not ready:", error)
+  if (error) console.log("Database check note:", error)
   else dbReady = true
   return dbReady
 }
 
-// ---------- reviews (key-value store) ----------
-// One review per paid booking, keyed by host so a listing's reviews are one
-// prefix scan. The host row's rating/reviews columns hold the running average.
+// ---------- Mutual Reviews (Driver <-> Host in KV store) ----------
 const reviewKey = (hostId: string, bookingId: string) =>
   `plughome:review:${hostId}:${bookingId}`
+const driverReviewKey = (driverId: string, bookingId: string) =>
+  `plughome:driver_review:${driverId}:${bookingId}`
+
 const reviewOut = (r: any) =>
   r && {
     bookingId: r.bookingId,
     hostId: r.hostId,
     stars: r.stars,
+    tags: Array.isArray(r.tags) ? r.tags : [],
     comment: r.comment,
     driverName: r.driverName,
     at: r.at,
   }
-// attach each paid booking's review so receipts know it's already rated
+const driverReviewOut = (r: any) =>
+  r && {
+    bookingId: r.bookingId,
+    driverId: r.driverId,
+    stars: r.stars,
+    tags: Array.isArray(r.tags) ? r.tags : [],
+    comment: r.comment,
+    hostName: r.hostName,
+    at: r.at,
+  }
+
 async function withReviews(rows: any[]) {
   const out = rows.map(bookingOut)
-  const rated = rows.filter((r) => r.status === "paid" && r.host_id)
-  if (!rated.length) return out
-  const found = await kv
-    .mget(rated.map((r) => reviewKey(r.host_id, r.id)))
-    .catch((e) => (console.log("Review lookup failed:", e), []))
-  const byId = new Map<string, any>()
-  for (const r of found) if (r?.bookingId) byId.set(r.bookingId, reviewOut(r))
-  return out.map((b) => (byId.has(b.id) ? { ...b, review: byId.get(b.id) } : b))
+  if (!rows.length) return out
+
+  const paid = rows.filter((r) => r.status === "paid")
+  const hostReviewKeys = paid
+    .filter((r) => r.host_id)
+    .map((r) => reviewKey(r.host_id, r.id))
+  const drvReviewKeys = paid
+    .filter((r) => r.driver_id)
+    .map((r) => driverReviewKey(r.driver_id, r.id))
+
+  const [foundHostRevs, foundDrvRevs] = await Promise.all([
+    hostReviewKeys.length
+      ? kv.mget(hostReviewKeys).catch(() => [])
+      : Promise.resolve([]),
+    drvReviewKeys.length
+      ? kv.mget(drvReviewKeys).catch(() => [])
+      : Promise.resolve([]),
+  ])
+
+  const byBookingHostRev = new Map<string, any>()
+  for (const r of foundHostRevs)
+    if (r?.bookingId) byBookingHostRev.set(r.bookingId, reviewOut(r))
+
+  const byBookingDrvRev = new Map<string, any>()
+  for (const r of foundDrvRevs)
+    if (r?.bookingId) byBookingDrvRev.set(r.bookingId, driverReviewOut(r))
+
+  const uniqueDrivers = [
+    ...new Set(rows.map((r) => r.driver_id).filter(Boolean)),
+  ]
+  const driverStats = new Map<
+    string,
+    { rating: number | null; reviews: number; recent: any[] }
+  >()
+  await Promise.all(
+    uniqueDrivers.map(async (did) => {
+      try {
+        const list = await kv.getByPrefix(`plughome:driver_review:${did}:`)
+        const valid = list
+          .map(driverReviewOut)
+          .filter(Boolean)
+          .sort((a: any, b: any) => b.at - a.at)
+        const count = valid.length
+        const avg =
+          count > 0
+            ? round1(
+                valid.reduce(
+                  (s: number, x: any) => s + Number(x.stars || 5),
+                  0,
+                ) / count,
+              )
+            : null
+        driverStats.set(did, {
+          rating: avg,
+          reviews: count,
+          recent: valid.slice(0, 5),
+        })
+      } catch {}
+    }),
+  )
+
+  return out.map((b) => {
+    const dStat = driverStats.get(b.driverId)
+    return {
+      ...b,
+      review: byBookingHostRev.get(b.id) || null,
+      driverReview: byBookingDrvRev.get(b.id) || null,
+      driverRating: dStat?.rating ?? null,
+      driverReviewsCount: dStat?.reviews ?? 0,
+      driverPastReviews: dStat?.recent ?? [],
+    }
+  })
 }
 
 // ---------- routes ----------
@@ -533,19 +599,10 @@ app.get(`${P}/health`, async (c) =>
   c.json({ status: "ok", database: await checkDb() }),
 )
 
-// public config: only public values and feature flags
 app.get(`${P}/config`, async (c) => {
-  if (!(await checkDb()))
-    return c.json(
-      {
-        error:
-          "The PLUG-HOME database isn't set up yet — run the schema migration.",
-      },
-      503,
-    )
+  await checkDb().catch(() => false)
   const storage = storageMode()
   return c.json({
-    // public; also renders media uploaded to Cloudinary earlier
     cloudName: cld().cloud || null,
     storage,
     uploads: storage === "cloudinary" || (await ensureBuckets()),
@@ -554,19 +611,17 @@ app.get(`${P}/config`, async (c) => {
   })
 })
 
-// demo-grade accounts: the app's OTP is a mock, so the device keeps a random
-// password per phone and the server creates a pre-confirmed user for it
 app.post(`${P}/auth/signup`, async (c) => {
   const body = await readBody(c)
   const name = clean(body.name, 60) || "PLUG-HOME user"
   const role = body.role === "host" ? "host" : "driver"
-  const password = String(body.password ?? "")
-  if (password.length < 16 || password.length > 128)
-    fail(400, "Couldn't create your account — please try again.")
+  const rawPass = String(body.password ?? "")
+  if (rawPass.length < 6 || rawPass.length > 128)
+    fail(400, "Password must be at least 6 characters.")
   const email = `${crypto.randomUUID()}@users.plughome.app`
   const { data, error } = await db.auth.admin.createUser({
     email,
-    password,
+    password: rawPass,
     email_confirm: true,
     user_metadata: { name, role },
   })
@@ -577,33 +632,68 @@ app.post(`${P}/auth/signup`, async (c) => {
       `Couldn't create your account: ${error?.message ?? "unknown error"}`,
     )
   }
-  // auth() backfills from user_metadata if this write fails
   const { error: pErr } = await db
     .from("profiles")
     .upsert({ id: data.user!.id, name, role })
-  if (pErr) console.log("Profile insert failed:", pErr)
+  if (pErr) console.log("Profile insert note:", pErr)
   return c.json({ email })
 })
 
+// GET /auth/profile -> Returns full persisted profile & Cloudinary/Storage photoUrl
+app.get(`${P}/auth/profile`, async (c) => {
+  const me = await auth(c)
+  const profile = await resolveFullProfile(me)
+  return c.json({ profile })
+})
+
+// POST /auth/profile -> Saves name, role, photoUrl, avatarPublicId, driverDetails & hostDetails
 app.post(`${P}/auth/profile`, async (c) => {
   const me = await auth(c)
   const body = await readBody(c)
-  const profile = {
-    name: clean(body.name, 60) || me.profile.name,
-    role:
-      body.role === "host"
-        ? "host"
-        : body.role === "driver"
-          ? "driver"
-          : me.profile.role,
+  const existing = (await kv.get(userProfileKey(me.id)).catch(() => null)) || {}
+
+  const name = clean(body.name, 60) || existing.name || me.profile.name
+  const role =
+    body.role === "host"
+      ? "host"
+      : body.role === "driver"
+        ? "driver"
+        : existing.role || me.profile.role
+
+  await db.from("profiles").upsert({ id: me.id, name, role })
+
+  const nextKv = {
+    ...existing,
+    name,
+    role,
+    phone: body.phone !== undefined ? clean(body.phone, 20) : existing.phone || "",
+    email: body.email !== undefined ? clean(body.email, 120) : existing.email || me.email || "",
+    photoUrl:
+      body.photoUrl !== undefined ? String(body.photoUrl || "") : existing.photoUrl || "",
+    avatarPublicId:
+      body.avatarPublicId !== undefined
+        ? body.avatarPublicId
+        : body.photoUrl === ""
+          ? null
+          : existing.avatarPublicId || null,
+    driverDetails:
+      body.driverDetails !== undefined
+        ? { ...(existing.driverDetails || {}), ...body.driverDetails }
+        : existing.driverDetails || null,
+    hostDetails:
+      body.hostDetails !== undefined
+        ? { ...(existing.hostDetails || {}), ...body.hostDetails }
+        : existing.hostDetails || null,
+    updatedAt: Date.now(),
   }
-  must(await db.from("profiles").upsert({ id: me.id, ...profile }))
+
+  await kv.set(userProfileKey(me.id), nextKv)
+  const profile = await resolveFullProfile({ id: me.id, email: me.email, profile: { name, role } })
   return c.json({ profile })
 })
 
 // ----- hosts -----
 app.get(`${P}/hosts`, async (c) => {
-  // real listings only: legacy seeded sample rows are never served
   const rows = must(
     await db
       .from("hosts")
@@ -623,8 +713,8 @@ app.post(`${P}/hosts`, async (c) => {
   const sock =
     SOCKETS[String(body.socket)] ?? fail(400, "Choose a socket type.")
   const rate = Number(body.rate)
-  if (!Number.isInteger(rate) || rate < 9 || rate > 18)
-    fail(400, "Rate must be between ₹9 and ₹18 per kWh.")
+  if (!Number.isInteger(rate) || rate < 8 || rate > 20)
+    fail(400, "Rate must be between ₹8 and ₹20 per kWh.")
   const { count, error: cErr } = await db
     .from("hosts")
     .select("id", { count: "exact", head: true })
@@ -634,7 +724,6 @@ app.post(`${P}/hosts`, async (c) => {
     fail(409, "You've reached the limit of 5 listed sockets.")
   const okLat = (v: unknown) => isNum(v) && Math.abs(v) <= 90
   const okLng = (v: unknown) => isNum(v) && Math.abs(v) <= 180
-  // the app geocodes the locality (or uses the host's GPS); never invent a spot
   if (!okLat(body.lat) || !okLng(body.lng))
     fail(
       400,
@@ -670,7 +759,6 @@ app.post(`${P}/hosts`, async (c) => {
   return c.json({ host })
 })
 
-// public: a listing's latest reviews (newest first)
 app.get(`${P}/hosts/:id/reviews`, async (c) => {
   const host = await getHost(c.req.param("id"))
   if (host.demo) return c.json({ reviews: [] })
@@ -683,7 +771,25 @@ app.get(`${P}/hosts/:id/reviews`, async (c) => {
   return c.json({ reviews })
 })
 
-// the owner removes a listing; past bookings keep their copy of the details
+app.get(`${P}/drivers/:id/reviews`, async (c) => {
+  const driverId = c.req.param("id")
+  const rows = await kv.getByPrefix(`plughome:driver_review:${driverId}:`)
+  const reviews = rows
+    .map(driverReviewOut)
+    .filter(Boolean)
+    .sort((a: any, b: any) => b.at - a.at)
+    .slice(0, 50)
+  const count = reviews.length
+  const rating =
+    count > 0
+      ? round1(
+          reviews.reduce((s: number, r: any) => s + Number(r.stars || 5), 0) /
+            count,
+        )
+      : null
+  return c.json({ rating, count, reviews })
+})
+
 app.delete(`${P}/hosts/:id`, async (c) => {
   const me = await auth(c)
   const host = await getHost(c.req.param("id"))
@@ -739,7 +845,6 @@ app.post(`${P}/hosts/:id/online`, async (c) => {
 // ----- bookings -----
 app.get(`${P}/bookings`, async (c) => {
   const me = await auth(c)
-  // sessions with retired sample hosts are not live data: never served
   const rows = must(
     await db
       .from("bookings")
@@ -773,8 +878,6 @@ app.post(`${P}/bookings`, async (c) => {
     fail(409, `${host.name} just went offline — pick another charger.`)
   if (host.owner_id === me.id) fail(409, "You can't book your own socket.")
   const estimateKwh = round1(((targetSoc - startSoc) / 100) * PACK)
-  // a hidden legacy sample session still in flight must not block this
-  // driver's real booking (one active booking per driver)
   must(
     await db
       .from("bookings")
@@ -783,8 +886,6 @@ app.post(`${P}/bookings`, async (c) => {
       .eq("demo_host", true)
       .in("status", IN_FLIGHT),
   )
-  // partial unique indexes enforce one active booking per driver and per real
-  // socket, so concurrent requests can't double-book
   const { data, error } = await db
     .from("bookings")
     .insert({
@@ -795,7 +896,6 @@ app.post(`${P}/bookings`, async (c) => {
       driver_id: me.id,
       driver_name: me.profile.name,
       demo_host: false,
-      // the real host owner accepts or declines
       status: "requested",
       start_soc: startSoc,
       target_soc: targetSoc,
@@ -827,12 +927,10 @@ app.post(`${P}/bookings/:id/action`, async (c) => {
   if (!ACTIONS.includes(action)) fail(400, "Unknown booking action.")
   const paid = action === "mark_paid" || action === "pay_demo"
   const id = c.req.param("id")
-  // the transition runs in one locked transaction in Postgres
   must(
     await db.rpc("plughome_booking_action", {
       p_booking_id: id,
       p_user: me.id,
-      // the SQL function still calls the payment confirmation pay_demo
       p_action: paid ? "pay_demo" : action,
       p_ref: paid ? `PH${shortId().slice(0, 8).toUpperCase()}` : null,
     }),
@@ -843,7 +941,6 @@ app.post(`${P}/bookings/:id/action`, async (c) => {
   return c.json({ booking: bookingOut(b) })
 })
 
-// the driver rates a paid session once; the host's average updates with it
 app.post(`${P}/bookings/:id/review`, async (c) => {
   const me = await auth(c)
   const body = await readBody(c)
@@ -856,10 +953,14 @@ app.post(`${P}/bookings/:id/review`, async (c) => {
   if (!b.host_id) fail(410, "That charger has been removed.")
   const key = reviewKey(b.host_id, b.id)
   if (await kv.get(key)) fail(409, "You've already rated this session.")
+  const tags = Array.isArray(body.tags)
+    ? body.tags.map((t: any) => clean(t, 32)).filter(Boolean).slice(0, 6)
+    : []
   const review = {
     bookingId: b.id,
     hostId: b.host_id,
     stars,
+    tags,
     comment: clean(body.comment, 280),
     driverName: me.profile.name,
     at: Date.now(),
@@ -879,6 +980,36 @@ app.post(`${P}/bookings/:id/review`, async (c) => {
   const [out] = await hostsOut([row])
   await broadcast([hostMsg(out), ...bookingMsgs(b)])
   return c.json({ review: reviewOut(review), host: out })
+})
+
+app.post(`${P}/bookings/:id/driver-review`, async (c) => {
+  const me = await auth(c)
+  const body = await readBody(c)
+  const stars = Number(body.stars)
+  if (!Number.isInteger(stars) || stars < 1 || stars > 5)
+    fail(400, "Pick a rating from 1 to 5 stars.")
+  const b = await getBooking(c.req.param("id"))
+  if (b.host_owner_id !== me.id)
+    fail(403, "Only the host can rate the driver for this session.")
+  if (b.status !== "paid")
+    fail(409, "You can rate the driver once the session is paid.")
+  const key = driverReviewKey(b.driver_id, b.id)
+  if (await kv.get(key)) fail(409, "You've already rated this driver.")
+  const tags = Array.isArray(body.tags)
+    ? body.tags.map((t: any) => clean(t, 32)).filter(Boolean).slice(0, 6)
+    : []
+  const driverReview = {
+    bookingId: b.id,
+    driverId: b.driver_id,
+    stars,
+    tags,
+    comment: clean(body.comment, 280),
+    hostName: me.profile.name || b.host_name,
+    at: Date.now(),
+  }
+  await kv.set(key, driverReview)
+  await broadcast(bookingMsgs(b))
+  return c.json({ driverReview: driverReviewOut(driverReview) })
 })
 
 // ----- meter readings -----
@@ -905,14 +1036,12 @@ app.post(`${P}/bookings/:id/readings/:stage/confirm`, async (c) => {
   if (!Number.isFinite(raw) || raw <= 0 || raw > 10_000_000)
     fail(400, "Enter the kWh number shown on the meter.")
   const id = c.req.param("id")
-  // both parties' values, kWh and the bill settle atomically in Postgres
   must(
     await db.rpc("plughome_confirm_reading", {
       p_booking_id: id,
       p_stage: stage,
       p_user: me.id,
       p_value: round1(raw),
-      // both real parties confirm; nobody auto-confirms on anyone's behalf
       p_auto: false,
       p_max_kwh: PACK * 4,
     }),
@@ -923,7 +1052,7 @@ app.post(`${P}/bookings/:id/readings/:stage/confirm`, async (c) => {
   return c.json({ booking: bookingOut(b), reading })
 })
 
-// ----- uploads (signed direct-to-Cloudinary or Supabase Storage) -----
+// ----- uploads (meter, host_media, and avatar) -----
 app.post(`${P}/uploads/sign`, async (c) => {
   const me = await auth(c)
   const body = await readBody(c)
@@ -953,6 +1082,9 @@ app.post(`${P}/uploads/sign`, async (c) => {
       fail(403, "You can only add media to your own socket.")
     stem = `hosts/${host.id}/media-${tag}`
     rec.host_id = host.id
+  } else if (purpose === "avatar") {
+    if (resourceType !== "image") fail(400, "Profile photo must be an image.")
+    stem = `avatars/${me.id}/avatar-${tag}`
   } else {
     return fail(400, "Unknown upload purpose.")
   }
@@ -968,7 +1100,7 @@ app.post(`${P}/uploads/sign`, async (c) => {
           ? "Please choose an MP4, MOV or WebM video."
           : "Please choose a JPG, PNG, WebP or HEIC photo.",
       )
-    if (!bucket.types.includes(type)) fail(400, "Meter proof must be a photo.")
+    if (!bucket.types.includes(type)) fail(400, "Invalid file type.")
     if (Number(body.size) > bucket.maxBytes)
       fail(413, `That file is too large — max ${bucket.maxBytes / MB} MB.`)
     const path = `${stem}.${EXT[type]}`
@@ -981,8 +1113,6 @@ app.post(`${P}/uploads/sign`, async (c) => {
     }
     rec.public_id = `${SB}${bucket.id}/${path}`
     must(await db.from("uploads").insert(rec))
-    // single-use token for exactly this object path; the browser PUTs the
-    // file to Storage, then /uploads/complete verifies and records it
     return c.json({
       uploadId,
       provider: "supabase",
@@ -1018,14 +1148,12 @@ app.post(`${P}/uploads/sign`, async (c) => {
   })
 })
 
-// best-effort number from Cloudinary OCR text: the longest numeric run
 function parseKwh(text: unknown) {
   const hits = String(text ?? "").match(/\d+(?:[.,]\d+)?/g) ?? []
   const best = hits.sort(
     (a, b) => b.replace(/\D/g, "").length - a.replace(/\D/g, "").length,
   )[0]
   const n = best ? Number(best.replace(",", ".")) : NaN
-  // above any real meter (and the column's range): ignore rather than guess
   return Number.isFinite(n) && n > 0 && n <= 10_000_000 ? round1(n) : null
 }
 
@@ -1033,7 +1161,6 @@ app.post(`${P}/uploads/complete`, async (c) => {
   const me = await auth(c)
   const body = await readBody(c)
   const uploadId = String(body.uploadId ?? "")
-  // uploads.id is a uuid: reject junk before Postgres does
   if (!/^[0-9a-f-]{36}$/i.test(uploadId))
     fail(404, "That upload has expired — please upload again.")
   const rec = must(
@@ -1048,7 +1175,6 @@ app.post(`${P}/uploads/complete`, async (c) => {
   if (rec.completed_at) fail(409, "That upload was already recorded.")
   if (Date.now() - (ms(rec.created_at) ?? 0) > DAY)
     fail(410, "That upload has expired — please upload again.")
-  // trust nothing from the browser: confirm the asset really exists
   const stored = parseStored(rec.public_id)
   if (stored) {
     const cut = stored.path.lastIndexOf("/")
@@ -1089,7 +1215,6 @@ app.post(`${P}/uploads/complete`, async (c) => {
       )
     }
   }
-  // single use: only the first completion wins
   const claimed = must(
     await db
       .from("uploads")
@@ -1100,11 +1225,38 @@ app.post(`${P}/uploads/complete`, async (c) => {
       .maybeSingle(),
   )
   if (!claimed) fail(409, "That upload was already recorded.")
+
+  // Handle Profile Photo (Avatar) upload completion
+  if (rec.purpose === "avatar") {
+    const existing =
+      (await kv.get(userProfileKey(me.id)).catch(() => null)) || {}
+    const oldMedia = parseStored(existing.avatarPublicId)
+    if (oldMedia && existing.avatarPublicId !== rec.public_id) {
+      db.storage
+        .from(oldMedia.bucket)
+        .remove([oldMedia.path])
+        .catch(() => {})
+    }
+    let photoUrl = ""
+    if (stored) {
+      const urls = await signMedia([rec.public_id])
+      photoUrl = urls.get(rec.public_id) || ""
+    } else {
+      photoUrl = cldAvatarUrl(rec.public_id)
+    }
+    await kv.set(userProfileKey(me.id), {
+      ...existing,
+      avatarPublicId: rec.public_id,
+      photoUrl,
+      updatedAt: Date.now(),
+    })
+    return c.json({ publicId: rec.public_id, photoUrl })
+  }
+
   if (rec.purpose === "meter") {
     const b = await getBooking(rec.booking_id)
     const party = asParty(b, me.id)
     if (b.status !== STAGE_STATUS[rec.stage]) stale(b)
-    // a new photo is new evidence: both parties confirm again
     const row = must(
       await db
         .from("meter_readings")
@@ -1113,7 +1265,6 @@ app.post(`${P}/uploads/complete`, async (c) => {
             booking_id: b.id,
             stage: rec.stage,
             public_id: rec.public_id,
-            // OCR only exists for Cloudinary uploads; otherwise typed by hand
             ocr_kwh: stored ? null : parseKwh(body.ocrText),
             driver_value: null,
             host_value: null,
@@ -1150,7 +1301,6 @@ app.post(`${P}/uploads/complete`, async (c) => {
       .maybeSingle(),
   )
   if (!row) fail(403, "You can only add media to your own socket.")
-  // replaced Storage media is no longer referenced anywhere: best-effort delete
   const old = parseStored(prev?.media_public_id)
   if (old && prev.media_public_id !== rec.public_id)
     db.storage

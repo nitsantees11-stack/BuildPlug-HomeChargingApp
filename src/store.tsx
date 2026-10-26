@@ -8,61 +8,117 @@ import {
   demoState,
   demoStep,
 } from "./demo"
-import { getHostPhotoCache } from "./lib/api"
+import { getSavedAvatar, saveAvatarPersistent } from "./lib/supabase"
 
-// Helper to load/save persistent user profile, photo, and app settings
 const STORAGE_PREFIX = "plughome:user_prefs:"
+const LAST_USER_KEY = "plughome:last_user_prefs"
+const FALLBACK_AVATAR_KEY = "plughome:avatar_backup"
 
-export function loadPersistedUserPrefs(userId) {
+function safeSetItem(key, value) {
+  try {
+    localStorage.setItem(key, value)
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function loadPersistedUserPrefs(userId, email, name) {
   if (typeof window === "undefined") return null
   try {
-    const raw = localStorage.getItem(`${STORAGE_PREFIX}${userId || "guest"}`)
-    return raw ? JSON.parse(raw) : null
+    const keysToTry = [
+      userId && `${STORAGE_PREFIX}${userId}`,
+      email && `${STORAGE_PREFIX}email:${email.trim().toLowerCase()}`,
+      name && `${STORAGE_PREFIX}name:${name.trim().toLowerCase()}`,
+      LAST_USER_KEY,
+    ].filter(Boolean)
+
+    let merged = null
+    for (const k of keysToTry) {
+      const raw = localStorage.getItem(k)
+      if (raw) {
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === "object") {
+          if (!merged) {
+            merged = { ...parsed }
+          } else {
+            if (!merged.photoUrl && parsed.photoUrl) merged.photoUrl = parsed.photoUrl
+            if (!merged.driverDetails && parsed.driverDetails)
+              merged.driverDetails = parsed.driverDetails
+            if (!merged.hostDetails && parsed.hostDetails)
+              merged.hostDetails = parsed.hostDetails
+            if (!merged.phone && parsed.phone) merged.phone = parsed.phone
+            if (!merged.email && parsed.email) merged.email = parsed.email
+          }
+        }
+      }
+    }
+
+    // Agar kisi purani plughome key mein photo पड़ी ho toh use bhi recover karo
+    if (merged && !merged.photoUrl) {
+      const backupPhoto =
+        getSavedAvatar() || localStorage.getItem(FALLBACK_AVATAR_KEY) || ""
+      if (backupPhoto) {
+        merged.photoUrl = backupPhoto
+      } else {
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i)
+          if (key && key.startsWith(STORAGE_PREFIX)) {
+            try {
+              const p = JSON.parse(localStorage.getItem(key) || "{}")
+              if (p?.photoUrl) {
+                merged.photoUrl = p.photoUrl
+                break
+              }
+            } catch {}
+          }
+        }
+      }
+    }
+
+    return merged
   } catch {
     return null
   }
 }
 
 export function savePersistedUserPrefs(userId, data) {
-  if (typeof window === "undefined") return
+  if (typeof window === "undefined" || !data) return
   try {
-    localStorage.setItem(
-      `${STORAGE_PREFIX}${userId || "guest"}`,
-      JSON.stringify(data),
-    )
-  } catch {}
-}
+    const existing = loadPersistedUserPrefs(userId, data.email, data.name)
+    const finalPhoto =
+      data.photoUrl !== undefined && data.photoUrl !== ""
+        ? data.photoUrl
+        : data.photoUrl === ""
+          ? existing?.photoUrl || getSavedAvatar() || ""
+          : existing?.photoUrl || getSavedAvatar() || ""
 
-// Merge cached host photos back into server host list so photos never disappear
-function attachHostPhotos(hosts = [], existingHosts = []) {
-  const cache = getHostPhotoCache()
-  return hosts.map((h) => {
-    const prev = existingHosts.find((x) => x.id === h.id)
-    const keyFull = `${(h.name || "").trim().toLowerCase()}|${(h.locality || "").trim().toLowerCase()}`
-    const keyName = (h.name || "").trim().toLowerCase()
-    const savedPhoto =
-      h.photo ||
-      h.photoUrl ||
-      h.img ||
-      h.image ||
-      prev?.photo ||
-      prev?.photoUrl ||
-      prev?.img ||
-      prev?.image ||
-      cache[h.id] ||
-      cache[keyFull] ||
-      cache[keyName]
-
-    if (!savedPhoto) return h
-    return {
-      ...h,
-      photo: h.photo || savedPhoto,
-      photoUrl: h.photoUrl || savedPhoto,
-      img: h.img || savedPhoto,
-      image: h.image || savedPhoto,
-      photos: h.photos?.length ? h.photos : [savedPhoto],
+    if (finalPhoto) {
+      saveAvatarPersistent(finalPhoto)
+      safeSetItem(FALLBACK_AVATAR_KEY, finalPhoto)
     }
-  })
+
+    const fullData = { ...data, photoUrl: finalPhoto }
+    const payload = JSON.stringify(fullData)
+    // Agar Base64 photo badi hone se 5MB quota full ho, toh lightweight copy save karo
+    const lightPayload = JSON.stringify({ ...fullData, photoUrl: "" })
+
+    const writeKey = (k) => {
+      if (!k) return
+      if (!safeSetItem(k, payload)) {
+        safeSetItem(k, lightPayload)
+      }
+    }
+
+    if (userId) writeKey(`${STORAGE_PREFIX}${userId}`)
+    if (data.email) {
+      writeKey(`${STORAGE_PREFIX}email:${data.email.trim().toLowerCase()}`)
+    }
+    if (data.name) {
+      writeKey(`${STORAGE_PREFIX}name:${data.name.trim().toLowerCase()}`)
+    }
+    writeKey(LAST_USER_KEY)
+  } catch {}
 }
 
 let tid = 0
@@ -74,7 +130,6 @@ const SIGNED_OUT = {
   userId: null,
   demo: false,
 }
-// no position until the driver shares GPS — never a stand-in location
 const NO_LOC = { lat: null, lng: null, areaName: "", located: false }
 
 const DEFAULT_SETTINGS = {
@@ -85,6 +140,9 @@ const DEFAULT_SETTINGS = {
   preferredRadiusKm: 5,
   autoSaveReceipts: true,
 }
+
+const initialSaved =
+  typeof window !== "undefined" ? loadPersistedUserPrefs(null, null, null) : null
 
 const initial = {
   session: SIGNED_OUT,
@@ -97,10 +155,15 @@ const initial = {
   toasts: [],
   demo: null,
   profile: {
-    photoUrl: "",
-    email: "",
-    driverDetails: null,
-    hostDetails: null,
+    photoUrl:
+      getSavedAvatar() ||
+      initialSaved?.photoUrl ||
+      (typeof window !== "undefined"
+        ? localStorage.getItem(FALLBACK_AVATAR_KEY) || ""
+        : ""),
+    email: initialSaved?.email || "",
+    driverDetails: initialSaved?.driverDetails || null,
+    hostDetails: initialSaved?.hostDetails || null,
   },
   settings: DEFAULT_SETTINGS,
   savedRecords: [],
@@ -114,14 +177,48 @@ const upsert = (list, item) =>
 function reducer(s, a) {
   switch (a.type) {
     case "LOGIN": {
-      const saved = loadPersistedUserPrefs(a.userId)
+      const saved = loadPersistedUserPrefs(a.userId, a.email, a.name)
+      const resolvedName = saved?.name || a.name
+      const resolvedPhone = saved?.phone || a.phone
+      const resolvedEmail = saved?.email || a.email || ""
+      const resolvedPhoto =
+        a.photoUrl ||
+        a.onboarding?.photoUrl ||
+        saved?.photoUrl ||
+        getSavedAvatar() ||
+        s.profile.photoUrl ||
+        (typeof window !== "undefined"
+          ? localStorage.getItem(FALLBACK_AVATAR_KEY) || ""
+          : "")
+      const resolvedDriver =
+        saved?.driverDetails ||
+        (a.role === "driver" ? a.onboarding : null) ||
+        s.profile.driverDetails ||
+        null
+      const resolvedHost =
+        saved?.hostDetails ||
+        (a.role === "host" ? a.onboarding : null) ||
+        s.profile.hostDetails ||
+        null
+
+      savePersistedUserPrefs(a.userId, {
+        name: resolvedName,
+        phone: resolvedPhone,
+        email: resolvedEmail,
+        photoUrl: resolvedPhoto,
+        driverDetails: resolvedDriver,
+        hostDetails: resolvedHost,
+        settings: saved?.settings || s.settings,
+        savedRecords: saved?.savedRecords || s.savedRecords,
+      })
+
       return {
         ...s,
         session: {
           role: a.role,
-          name: saved?.name || a.name,
-          phone: saved?.phone || a.phone,
-          email: saved?.email || a.email || "",
+          name: resolvedName,
+          phone: resolvedPhone,
+          email: resolvedEmail,
           userId: a.userId,
           demo: false,
         },
@@ -129,10 +226,10 @@ function reducer(s, a) {
         hostTab: "overview",
         demo: null,
         profile: {
-          photoUrl: saved?.photoUrl || "",
-          email: saved?.email || a.email || "",
-          driverDetails: saved?.driverDetails || null,
-          hostDetails: saved?.hostDetails || null,
+          photoUrl: resolvedPhoto,
+          email: resolvedEmail,
+          driverDetails: resolvedDriver,
+          hostDetails: resolvedHost,
         },
         settings: { ...DEFAULT_SETTINGS, ...(saved?.settings || {}) },
         savedRecords: saved?.savedRecords || [],
@@ -140,7 +237,14 @@ function reducer(s, a) {
     }
     case "DEMO_LOGIN": {
       const who = DEMO_USERS[a.role]
-      const saved = loadPersistedUserPrefs(who.id)
+      const saved = loadPersistedUserPrefs(who.id, "demo@plughome.in", who.name)
+      const resolvedPhoto =
+        saved?.photoUrl ||
+        getSavedAvatar() ||
+        s.profile.photoUrl ||
+        (typeof window !== "undefined"
+          ? localStorage.getItem(FALLBACK_AVATAR_KEY) || ""
+          : "")
       return {
         ...s,
         session: {
@@ -153,7 +257,6 @@ function reducer(s, a) {
         },
         driverTab: "find",
         hostTab: "overview",
-        // fixed, labelled simulated location — browser GPS isn't used
         user: {
           ...DEMO_LOC,
           areaName: DEMO_AREA,
@@ -166,13 +269,69 @@ function reducer(s, a) {
         route: null,
         demo: demoState(),
         profile: {
-          photoUrl: saved?.photoUrl || "",
+          photoUrl: resolvedPhoto,
           email: saved?.email || "demo@plughome.in",
           driverDetails: saved?.driverDetails || null,
           hostDetails: saved?.hostDetails || null,
         },
         settings: { ...DEFAULT_SETTINGS, ...(saved?.settings || {}) },
         savedRecords: saved?.savedRecords || [],
+      }
+    }
+    case "HYDRATE_BACKEND_PROFILE": {
+      const meta = a.meta || {}
+      const nextName = meta.name || s.session.name
+      const nextPhone = meta.phone || s.session.phone
+      const nextEmail =
+        a.email || meta.email || s.profile.email || s.session.email
+      const saved = loadPersistedUserPrefs(
+        s.session.userId,
+        nextEmail,
+        nextName,
+      )
+      const nextPhoto =
+        meta.photoUrl ||
+        meta.avatar_url ||
+        meta.avatar ||
+        s.profile.photoUrl ||
+        saved?.photoUrl ||
+        getSavedAvatar() ||
+        (typeof window !== "undefined"
+          ? localStorage.getItem(FALLBACK_AVATAR_KEY) || ""
+          : "")
+      const nextDriver = meta.driverDetails
+        ? { ...(s.profile.driverDetails || {}), ...meta.driverDetails }
+        : s.profile.driverDetails || saved?.driverDetails || null
+      const nextHost = meta.hostDetails
+        ? { ...(s.profile.hostDetails || {}), ...meta.hostDetails }
+        : s.profile.hostDetails || saved?.hostDetails || null
+
+      savePersistedUserPrefs(s.session.userId, {
+        name: nextName,
+        phone: nextPhone,
+        email: nextEmail,
+        photoUrl: nextPhoto,
+        driverDetails: nextDriver,
+        hostDetails: nextHost,
+        settings: s.settings,
+        savedRecords: s.savedRecords,
+      })
+
+      return {
+        ...s,
+        session: {
+          ...s.session,
+          name: nextName,
+          phone: nextPhone,
+          email: nextEmail,
+        },
+        profile: {
+          ...s.profile,
+          photoUrl: nextPhoto,
+          email: nextEmail,
+          driverDetails: nextDriver,
+          hostDetails: nextHost,
+        },
       }
     }
     case "LOGOUT":
@@ -190,7 +349,6 @@ function reducer(s, a) {
     case "SET_ROLE":
       if (!s.session.demo)
         return { ...s, session: { ...s.session, role: a.role } }
-      // Judge Mode has one persona per side
       return {
         ...s,
         session: {
@@ -201,6 +359,16 @@ function reducer(s, a) {
         },
       }
     case "UPDATE_PROFILE": {
+      if (a.photoUrl === "") {
+        saveAvatarPersistent("")
+        try {
+          localStorage.removeItem(FALLBACK_AVATAR_KEY)
+        } catch {}
+      } else if (a.photoUrl) {
+        saveAvatarPersistent(a.photoUrl)
+        safeSetItem(FALLBACK_AVATAR_KEY, a.photoUrl)
+      }
+
       const nextSession = {
         ...s.session,
         name: a.name !== undefined ? a.name : s.session.name,
@@ -209,7 +377,14 @@ function reducer(s, a) {
       }
       const nextProfile = {
         ...s.profile,
-        photoUrl: a.photoUrl !== undefined ? a.photoUrl : s.profile.photoUrl,
+        photoUrl:
+          a.photoUrl !== undefined
+            ? a.photoUrl
+            : s.profile.photoUrl ||
+              getSavedAvatar() ||
+              (typeof window !== "undefined"
+                ? localStorage.getItem(FALLBACK_AVATAR_KEY) || ""
+                : ""),
         email: a.email !== undefined ? a.email : s.profile.email,
         driverDetails:
           a.driverDetails !== undefined
@@ -262,15 +437,11 @@ function reducer(s, a) {
     case "USER":
       return { ...s, user: { ...s.user, ...a.patch } }
     case "HOSTS":
-      // the server list never replaces Judge Mode's local chargers
-      return s.session.demo
-        ? s
-        : { ...s, hosts: attachHostPhotos(a.hosts, s.hosts) }
+      return s.session.demo ? s : { ...s, hosts: a.hosts || [] }
     case "SELECT":
       return { ...s, selectedHostId: a.id }
     case "ROUTE":
       return { ...s, route: a.route }
-    // ---- Judge Mode only (ignored outside a demo session) ----
     case "DEMO_HOST":
       if (!s.demo) return s
       return {
@@ -315,7 +486,6 @@ function reducer(s, a) {
       const stage = { confirm_start: "start", confirm_end: "end" }[a.action]
       if (stage) {
         const r = readings[b.id]?.[stage]
-        // the simulated other party confirms the same number
         readings = {
           ...readings,
           [b.id]: {

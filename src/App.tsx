@@ -20,6 +20,7 @@ import {
   MapPin,
   Menu,
   PhoneCall,
+  Plus,
   PlusCircle,
   RefreshCw,
   Save,
@@ -43,10 +44,14 @@ import Proof from "./screens/Proof"
 import { LiveNotifier } from "./screens/LiveMeter"
 import {
   checkEmailRedirectCallback,
+  fetchAvatarFromBucket,
   getSavedOnboarding,
   isLive,
+  removeAvatarFromBucket,
   signInAs,
   signOut,
+  supabase,
+  uploadAvatarToBucket,
 } from "./lib/supabase"
 import {
   probeBackend,
@@ -90,7 +95,7 @@ const ALL_PERKS = [
   "Solar",
 ]
 
-// Sync updated onboarding details back into any matching localStorage keys used by supabase.js
+// Sync updated onboarding details into localStorage keys used by supabase.js
 function syncOnboardingStorage(userId, role, updatedDetails) {
   if (typeof window === "undefined") return
   try {
@@ -111,6 +116,27 @@ function syncOnboardingStorage(userId, role, updatedDetails) {
         } catch {}
       }
     }
+  } catch {}
+}
+
+// Persist user details and Supabase Bucket photoUrl to Supabase Auth Backend (user_metadata)
+async function syncProfileToSupabaseBackend(patch) {
+  if (!isLive || !supabase?.auth?.updateUser) return
+  try {
+    const { photoUrl, ...safeMeta } = patch || {}
+    const isHttp =
+      typeof photoUrl === "string" &&
+      (photoUrl.startsWith("http://") || photoUrl.startsWith("https://"))
+    await supabase.auth.updateUser({
+      data: {
+        ...safeMeta,
+        ...(isHttp
+          ? { photoUrl, avatarUrl: photoUrl }
+          : photoUrl === ""
+            ? { photoUrl: "", avatarUrl: "" }
+            : {}),
+      },
+    })
   } catch {}
 }
 
@@ -166,6 +192,8 @@ function SideDrawer({
   const { state, dispatch } = useStore()
   const toast = useToast()
   const fileInputRef = useRef(null)
+  const [savingBackend, setSavingBackend] = useState(false)
+  const [uploadingPhoto, setUploadingPhoto] = useState(false)
 
   const role = state.session.role
   const userId = state.session.userId
@@ -174,14 +202,14 @@ function SideDrawer({
     role === "host" ? state.profile.hostDetails : state.profile.driverDetails
   const mergedProfile = { ...baseOnboarding, ...(customDetails || {}) }
 
-  // Form state for editing personal + onboarding details
+  // Personal fields
   const [name, setName] = useState(state.session.name || "")
   const [phone, setPhone] = useState(state.session.phone || "")
   const [email, setEmail] = useState(
     state.profile.email || state.session.email || "",
   )
 
-  // Driver fields
+  // Driver EV & Charging fields (supports both preset selection and custom typing)
   const [evModel, setEvModel] = useState(
     mergedProfile.evModel || "Tata Tigor.ev",
   )
@@ -198,6 +226,9 @@ function SideDrawer({
   const [carriesCable, setCarriesCable] = useState(
     mergedProfile.carriesCable || "Yes, in boot",
   )
+  const [maxDetourKm, setMaxDetourKm] = useState(
+    mergedProfile.maxDetourKm || "2 km",
+  )
   const [upiId, setUpiId] = useState(mergedProfile.upiId || "")
   const [emergencyPhone, setEmergencyPhone] = useState(
     mergedProfile.emergencyPhone || "",
@@ -206,8 +237,9 @@ function SideDrawer({
     mergedProfile.preferredPerks ||
       mergedProfile.perks || ["Family Verified", "CCTV Guarded"],
   )
+  const [customPerkInput, setCustomPerkInput] = useState("")
 
-  // Host fields
+  // Host fields (supports both preset selection and custom typing)
   const [homeTitle, setHomeTitle] = useState(
     mergedProfile.homeTitle || `${state.session.name || "My"}'s Home Socket`,
   )
@@ -231,7 +263,7 @@ function SideDrawer({
   const [calcTargetSoc, setCalcTargetSoc] = useState(85)
   const [calcRate, setCalcRate] = useState(mergedProfile.ratePerKwh || 12)
 
-  // Keep local form synced when drawer opens or role changes
+  // Keep local form synced when drawer opens or role/profile changes
   useEffect(() => {
     if (!open) return
     const saved = getSavedOnboarding(userId, role) || {}
@@ -248,6 +280,7 @@ function SideDrawer({
     setCurrentSoc(m.currentSoc || state.user.soc || 26)
     setConnectorType(m.connectorType || "Both 15A & Type-2")
     setCarriesCable(m.carriesCable || "Yes, in boot")
+    setMaxDetourKm(m.maxDetourKm || "2 km")
     setUpiId(m.upiId || "")
     setEmergencyPhone(m.emergencyPhone || "")
     setPerks(
@@ -259,7 +292,7 @@ function SideDrawer({
     setPowerKw(m.powerKw || 7.2)
     setRatePerKwh(m.ratePerKwh || 12)
     setAvailabilitySlot(m.availabilitySlot || "24×7 Anytime")
-  }, [open, role, userId])
+  }, [open, role, userId, state.profile.driverDetails, state.profile.hostDetails])
 
   const initials = (state.session.name || "U")
     .split(" ")
@@ -279,9 +312,9 @@ function SideDrawer({
     const reader = new FileReader()
     reader.onload = () => {
       const img = new Image()
-      img.onload = () => {
+      img.onload = async () => {
         const canvas = document.createElement("canvas")
-        const maxDim = 256
+        const maxDim = 320
         let w = img.width
         let h = img.height
         if (w > h) {
@@ -298,16 +331,55 @@ function SideDrawer({
         const ctx = canvas.getContext("2d")
         ctx.drawImage(img, 0, 0, w, h)
         const dataUrl = canvas.toDataURL("image/jpeg", 0.85)
+
+        // Show instant preview first
         dispatch({ type: "UPDATE_PROFILE", photoUrl: dataUrl })
-        toast("Profile photo updated", "Your new avatar is saved.")
+
+        // Upload compressed JPEG blob to Supabase Storage Bucket ('avatars')
+        if (isLive && !state.session.demo && userId) {
+          setUploadingPhoto(true)
+          try {
+            const blob = await new Promise((resolve) =>
+              canvas.toBlob(resolve, "image/jpeg", 0.85),
+            )
+            const bucketUrl = await uploadAvatarToBucket(userId, blob)
+            if (bucketUrl) {
+              dispatch({ type: "UPDATE_PROFILE", photoUrl: bucketUrl })
+              await syncProfileToSupabaseBackend({ photoUrl: bucketUrl })
+              toast(
+                "Profile photo uploaded to Supabase Bucket!",
+                "Saved in 'avatars' bucket — will load automatically on every login.",
+              )
+              return
+            }
+          } catch (err) {
+            toast(
+              "Bucket upload note",
+              err?.message ||
+                "Saved locally. Create a public 'avatars' bucket in Supabase Storage for cloud sync.",
+              { tone: "warn" },
+            )
+          } finally {
+            setUploadingPhoto(false)
+          }
+        } else {
+          toast(
+            "Profile photo saved!",
+            "Synced to your account — stays saved even after you log out.",
+          )
+        }
       }
       img.src = reader.result
     }
     reader.readAsDataURL(file)
   }
 
-  const handleRemovePhoto = () => {
+  const handleRemovePhoto = async () => {
     dispatch({ type: "UPDATE_PROFILE", photoUrl: "" })
+    if (isLive && !state.session.demo && userId) {
+      await removeAvatarFromBucket(userId)
+    }
+    await syncProfileToSupabaseBackend({ photoUrl: "" })
     toast("Profile photo removed", "Switched back to your initials avatar.")
   }
 
@@ -317,59 +389,92 @@ function SideDrawer({
     )
   }
 
-  const handleSaveProfile = (e) => {
-    e.preventDefault()
-    const cleanName = name.trim() || "User"
-    if (role === "driver") {
-      const driverDetails = {
-        evModel,
-        batteryKwh: Number(batteryKwh) || 26,
-        regNumber: regNumber.trim().toUpperCase(),
-        currentSoc: Number(currentSoc) || 26,
-        connectorType,
-        carriesCable,
-        preferredPerks: perks,
-        upiId: upiId.trim(),
-        emergencyPhone: emergencyPhone.trim(),
-        updatedAt: new Date().toISOString(),
-      }
-      syncOnboardingStorage(userId, "driver", driverDetails)
-      dispatch({
-        type: "UPDATE_PROFILE",
-        name: cleanName,
-        phone: phone.trim(),
-        email: email.trim(),
-        soc: Number(currentSoc) || 26,
-        driverDetails,
-      })
-    } else {
-      const hostDetails = {
-        homeTitle: homeTitle.trim(),
-        locality: locality.trim(),
-        socketType,
-        powerKw: Number(powerKw) || 7.2,
-        ratePerKwh: Number(ratePerKwh) || 12,
-        availabilitySlot,
-        perks,
-        upiId: upiId.trim(),
-        updatedAt: new Date().toISOString(),
-      }
-      syncOnboardingStorage(userId, "host", hostDetails)
-      dispatch({
-        type: "UPDATE_PROFILE",
-        name: cleanName,
-        phone: phone.trim(),
-        email: email.trim(),
-        hostDetails,
-      })
+  const handleAddCustomPerk = () => {
+    const clean = customPerkInput.trim()
+    if (!clean) return
+    if (!perks.includes(clean)) {
+      setPerks((prev) => [...prev, clean])
     }
-    toast(
-      "Profile details saved!",
-      "Your updated details are now active across PLUG-HOME.",
-    )
+    setCustomPerkInput("")
+  }
+
+  const handleSaveProfile = async (e) => {
+    e.preventDefault()
+    setSavingBackend(true)
+    const cleanName = name.trim() || "User"
+
+    try {
+      if (role === "driver") {
+        const driverDetails = {
+          evModel: evModel.trim() || "Tata Tigor.ev",
+          batteryKwh: Number(batteryKwh) || 26,
+          regNumber: regNumber.trim().toUpperCase(),
+          currentSoc: Number(currentSoc) || 26,
+          connectorType: connectorType.trim() || "Both 15A & Type-2",
+          carriesCable: carriesCable.trim() || "Yes, in boot",
+          maxDetourKm: maxDetourKm.trim() || "2 km",
+          preferredPerks: perks,
+          upiId: upiId.trim(),
+          emergencyPhone: emergencyPhone.trim(),
+          updatedAt: new Date().toISOString(),
+        }
+        syncOnboardingStorage(userId, "driver", driverDetails)
+        dispatch({
+          type: "UPDATE_PROFILE",
+          name: cleanName,
+          phone: phone.trim(),
+          email: email.trim(),
+          soc: Number(currentSoc) || 26,
+          driverDetails,
+        })
+        await syncProfileToSupabaseBackend({
+          name: cleanName,
+          phone: phone.trim(),
+          email: email.trim(),
+          photoUrl: state.profile.photoUrl || "",
+          driverDetails,
+          onboarding: driverDetails,
+        })
+      } else {
+        const hostDetails = {
+          homeTitle: homeTitle.trim(),
+          locality: locality.trim(),
+          socketType: socketType.trim() || "7.2kW Fast",
+          powerKw: Number(powerKw) || 7.2,
+          ratePerKwh: Number(ratePerKwh) || 12,
+          availabilitySlot: availabilitySlot.trim() || "24×7 Anytime",
+          perks,
+          upiId: upiId.trim(),
+          updatedAt: new Date().toISOString(),
+        }
+        syncOnboardingStorage(userId, "host", hostDetails)
+        dispatch({
+          type: "UPDATE_PROFILE",
+          name: cleanName,
+          phone: phone.trim(),
+          email: email.trim(),
+          hostDetails,
+        })
+        await syncProfileToSupabaseBackend({
+          name: cleanName,
+          phone: phone.trim(),
+          email: email.trim(),
+          photoUrl: state.profile.photoUrl || "",
+          hostDetails,
+          onboarding: hostDetails,
+        })
+      }
+      toast(
+        "Profile synced to backend!",
+        "Your photo, EV & charging details are saved permanently.",
+      )
+    } finally {
+      setSavingBackend(false)
+    }
   }
 
   // Filter user's records
+    // Filter user's records
   const myRecords = (bookings || []).filter(
     (b) =>
       b.driverId === userId ||
@@ -384,15 +489,19 @@ function SideDrawer({
     return ["cancelled", "declined", "disputed"].includes(b.status)
   })
 
-  const totalKwh = myRecords.reduce(
-    (acc, b) => acc + (Number(b.kwhUsed) || Number(b.estimateKwh) || 0),
+  // SIRF successful (paid) sessions ko total stats aur CO2 mein jodo
+  const successfulRecords = myRecords.filter((b) => b.status === "paid")
+
+  const totalKwh = successfulRecords.reduce(
+    (acc, b) => acc + (Number(b.kwhUsed) || 0),
     0,
   )
-  const totalAmount = myRecords.reduce(
-    (acc, b) => acc + (Number(b.amount) || Number(b.estimateAmount) || 0),
+  const totalAmount = successfulRecords.reduce(
+    (acc, b) => acc + (Number(b.amount) || 0),
     0,
   )
   const totalCo2 = co2(totalKwh)
+
 
   const exportRecordsCsv = () => {
     if (!myRecords.length) {
@@ -449,6 +558,9 @@ function SideDrawer({
     ["settings", "Settings", Settings],
   ]
 
+  // Combine default perks with any custom perks the user typed
+  const displayedPerks = Array.from(new Set([...ALL_PERKS, ...perks]))
+
   return (
     <AnimatePresence>
       {open && (
@@ -495,7 +607,11 @@ function SideDrawer({
                       title="Upload or change profile photo"
                       className="absolute -bottom-1.5 -right-1.5 h-7 w-7 rounded-full btn-primary grid place-items-center shadow-md"
                     >
-                      <Camera size={13} />
+                      {uploadingPhoto ? (
+                        <Loader2 size={13} className="animate-spin" />
+                      ) : (
+                        <Camera size={13} />
+                      )}
                     </button>
                     <input
                       ref={fileInputRef}
@@ -569,19 +685,27 @@ function SideDrawer({
                   <div className="rounded-2xl bg-mint/60 border border-line p-3.5 flex items-center justify-between gap-3">
                     <div className="text-xs">
                       <p className="font-display font-bold text-ink">
-                        Profile Photo & Identity
+                        Profile Photo (Synced to Account)
                       </p>
                       <p className="text-slate mt-0.5">
-                        Tap the camera icon or button to change your photo.
+                        Saved permanently to your Supabase Bucket across logins.
                       </p>
                     </div>
                     <button
                       type="button"
+                      disabled={uploadingPhoto}
                       onClick={() => fileInputRef.current?.click()}
                       className="h-9 px-3 rounded-xl bg-white border border-line text-xs font-display font-bold inline-flex items-center gap-1.5 hover:bg-mint shrink-0"
                     >
-                      <Camera size={14} className="text-parrot-ink" />
-                      Upload Photo
+                      {uploadingPhoto ? (
+                        <Loader2
+                          size={14}
+                          className="text-parrot-ink animate-spin"
+                        />
+                      ) : (
+                        <Camera size={14} className="text-parrot-ink" />
+                      )}
+                      {uploadingPhoto ? "Uploading…" : "Upload Photo"}
                     </button>
                   </div>
 
@@ -622,12 +746,17 @@ function SideDrawer({
                   </label>
 
                   {role === "driver" ? (
-                    <>
-                      <div className="pt-2 border-t border-line">
-                        <p className="text-xs font-bold uppercase tracking-wider text-parrot-ink mb-2.5">
-                          EV Vehicle & Charging Details
-                        </p>
-                        <div className="grid grid-cols-2 gap-2 mb-3">
+                    <div className="pt-2 border-t border-line space-y-3.5">
+                      <p className="text-xs font-bold uppercase tracking-wider text-parrot-ink">
+                        EV Vehicle & Charging Details (Select or Type)
+                      </p>
+
+                      {/* EV MODEL: Quick Select + Type Custom Input */}
+                      <div>
+                        <span className="block text-xs font-semibold text-slate mb-1.5">
+                          Select or Type Your EV Model
+                        </span>
+                        <div className="grid grid-cols-2 gap-1.5 mb-2">
                           {EV_MODELS.map(([m, kwh]) => (
                             <button
                               key={m}
@@ -636,7 +765,7 @@ function SideDrawer({
                                 setEvModel(m)
                                 setBatteryKwh(kwh)
                               }}
-                              className={`h-9 px-2.5 rounded-xl text-xs font-display font-bold border text-left truncate flex items-center gap-1.5 ${
+                              className={`h-8 px-2.5 rounded-xl text-xs font-display font-bold border text-left truncate flex items-center gap-1.5 ${
                                 evModel === m
                                   ? "bg-parrot/20 border-parrot text-ink"
                                   : "bg-mint border-transparent text-slate hover:text-ink"
@@ -652,68 +781,105 @@ function SideDrawer({
                             </button>
                           ))}
                         </div>
+                        <input
+                          value={evModel}
+                          onChange={(e) => setEvModel(e.target.value)}
+                          placeholder="Type custom EV model (e.g. MG Windsor EV, BYD Atto 3, Ola S1 Pro)..."
+                          className="w-full h-10 rounded-xl bg-mint px-3 text-sm text-ink font-medium border border-line focus:border-parrot outline-none"
+                        />
+                      </div>
 
-                        <div className="grid grid-cols-2 gap-3">
-                          <label className="block text-xs font-semibold text-slate">
-                            Battery Size (kWh)
-                            <input
-                              type="number"
-                              step="0.5"
-                              value={batteryKwh}
-                              onChange={(e) => setBatteryKwh(e.target.value)}
-                              className="mt-1 w-full h-10 rounded-xl bg-mint px-3 font-mono text-sm text-ink border border-transparent focus:border-parrot outline-none"
-                            />
-                          </label>
-                          <label className="block text-xs font-semibold text-slate">
-                            Vehicle Reg. Plate
-                            <input
-                              value={regNumber}
-                              onChange={(e) =>
-                                setRegNumber(e.target.value.toUpperCase())
-                              }
-                              placeholder="DL01EV2026"
-                              className="mt-1 w-full h-10 rounded-xl bg-mint px-3 font-mono text-sm uppercase text-ink border border-transparent focus:border-parrot outline-none"
-                            />
-                          </label>
-                        </div>
-
-                        <div className="mt-3 rounded-xl bg-mint p-3">
-                          <div className="flex justify-between text-xs font-bold">
-                            <span className="text-parrot-ink flex items-center gap-1">
-                              <BatteryCharging size={14} /> Current Battery SoC
-                            </span>
-                            <span className="font-mono text-ink">
-                              {currentSoc}%
-                            </span>
-                          </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <label className="block text-xs font-semibold text-slate">
+                          Battery Size (kWh)
                           <input
-                            type="range"
-                            min="5"
-                            max="95"
-                            value={currentSoc}
-                            onChange={(e) =>
-                              setCurrentSoc(Number(e.target.value))
-                            }
-                            className="mt-1.5 w-full accent-[#72D600]"
+                            type="number"
+                            step="0.5"
+                            value={batteryKwh}
+                            onChange={(e) => setBatteryKwh(e.target.value)}
+                            placeholder="e.g. 35"
+                            className="mt-1 w-full h-10 rounded-xl bg-mint px-3 font-mono text-sm text-ink border border-transparent focus:border-parrot outline-none"
                           />
-                        </div>
+                        </label>
+                        <label className="block text-xs font-semibold text-slate">
+                          Vehicle Reg. Plate
+                          <input
+                            value={regNumber}
+                            onChange={(e) =>
+                              setRegNumber(e.target.value.toUpperCase())
+                            }
+                            placeholder="DL01EV2026"
+                            className="mt-1 w-full h-10 rounded-xl bg-mint px-3 font-mono text-sm uppercase text-ink border border-transparent focus:border-parrot outline-none"
+                          />
+                        </label>
+                      </div>
 
-                        <div className="mt-3">
-                          <span className="block text-xs font-semibold text-slate mb-1.5">
-                            Supported Connector Type
+                      <div className="rounded-xl bg-mint p-3">
+                        <div className="flex justify-between text-xs font-bold">
+                          <span className="text-parrot-ink flex items-center gap-1">
+                            <BatteryCharging size={14} /> Current Battery SoC
                           </span>
-                          <div className="grid grid-cols-3 gap-1.5">
-                            {[
-                              "15A Plug",
-                              "7.2kW Fast",
-                              "Both 15A & Type-2",
-                            ].map((c) => (
+                          <span className="font-mono text-ink">
+                            {currentSoc}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="5"
+                          max="95"
+                          value={currentSoc}
+                          onChange={(e) =>
+                            setCurrentSoc(Number(e.target.value))
+                          }
+                          className="mt-1.5 w-full accent-[#72D600]"
+                        />
+                      </div>
+
+                      {/* CHARGING CONNECTOR TYPE: Quick Select + Type Custom Input */}
+                      <div>
+                        <span className="block text-xs font-semibold text-slate mb-1.5">
+                          Supported Charging Socket / Connector (Select or Type)
+                        </span>
+                        <div className="grid grid-cols-3 gap-1.5 mb-2">
+                          {["15A Plug", "7.2kW Fast", "Both 15A & Type-2"].map(
+                            (c) => (
                               <button
                                 key={c}
                                 type="button"
                                 onClick={() => setConnectorType(c)}
-                                className={`h-9 px-2 rounded-xl text-[11px] font-display font-bold border truncate ${
+                                className={`h-8 px-2 rounded-xl text-[11px] font-display font-bold border truncate ${
                                   connectorType === c
+                                    ? "bg-parrot/20 border-parrot text-ink"
+                                    : "bg-mint border-transparent text-slate"
+                                }`}
+                              >
+                                {c}
+                              </button>
+                            ),
+                          )}
+                        </div>
+                        <input
+                          value={connectorType}
+                          onChange={(e) => setConnectorType(e.target.value)}
+                          placeholder="Type charging/connector spec (e.g. CCS2 + Type-2, 11kW AC, 3.3kW)..."
+                          className="w-full h-10 rounded-xl bg-mint px-3 text-sm text-ink border border-line focus:border-parrot outline-none"
+                        />
+                      </div>
+
+                      {/* PORTABLE CABLE & DETOUR: Quick Select + Type Custom Input */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div>
+                          <span className="block text-xs font-semibold text-slate mb-1">
+                            Charging Cable / Adapter
+                          </span>
+                          <div className="grid grid-cols-2 gap-1 mb-1.5">
+                            {["Yes, in boot", "Need host cable"].map((c) => (
+                              <button
+                                key={c}
+                                type="button"
+                                onClick={() => setCarriesCable(c)}
+                                className={`h-7 px-2 rounded-lg text-[10px] font-display font-bold border truncate ${
+                                  carriesCable === c
                                     ? "bg-parrot/20 border-parrot text-ink"
                                     : "bg-mint border-transparent text-slate"
                                 }`}
@@ -722,97 +888,190 @@ function SideDrawer({
                               </button>
                             ))}
                           </div>
+                          <input
+                            value={carriesCable}
+                            onChange={(e) => setCarriesCable(e.target.value)}
+                            placeholder="Type cable details..."
+                            className="w-full h-9 rounded-xl bg-mint px-3 text-xs text-ink border border-line focus:border-parrot outline-none"
+                          />
                         </div>
 
-                        <div className="mt-3 grid grid-cols-2 gap-3">
-                          <label className="block text-xs font-semibold text-slate">
-                            Your UPI ID
-                            <input
-                              value={upiId}
-                              onChange={(e) => setUpiId(e.target.value)}
-                              placeholder="user@okaxis"
-                              className="mt-1 w-full h-10 rounded-xl bg-mint px-3 font-mono text-xs text-ink border border-transparent focus:border-parrot outline-none"
-                            />
-                          </label>
-                          <label className="block text-xs font-semibold text-slate">
-                            Emergency Contact
-                            <input
-                              value={emergencyPhone}
-                              onChange={(e) =>
-                                setEmergencyPhone(
-                                  e.target.value
-                                    .replace(/\D/g, "")
-                                    .slice(0, 10),
-                                )
-                              }
-                              placeholder="98XXXXXX00"
-                              className="mt-1 w-full h-10 rounded-xl bg-mint px-3 font-mono text-xs text-ink border border-transparent focus:border-parrot outline-none"
-                            />
-                          </label>
+                        <div>
+                          <span className="block text-xs font-semibold text-slate mb-1">
+                            Preferred Detour Distance
+                          </span>
+                          <div className="grid grid-cols-3 gap-1 mb-1.5">
+                            {["1 km", "2 km", "5 km"].map((d) => (
+                              <button
+                                key={d}
+                                type="button"
+                                onClick={() => setMaxDetourKm(d)}
+                                className={`h-7 px-1.5 rounded-lg text-[10px] font-display font-bold border truncate ${
+                                  maxDetourKm === d
+                                    ? "bg-parrot/20 border-parrot text-ink"
+                                    : "bg-mint border-transparent text-slate"
+                                }`}
+                              >
+                                {d}
+                              </button>
+                            ))}
+                          </div>
+                          <input
+                            value={maxDetourKm}
+                            onChange={(e) => setMaxDetourKm(e.target.value)}
+                            placeholder="e.g. Within 3 km"
+                            className="w-full h-9 rounded-xl bg-mint px-3 text-xs text-ink border border-line focus:border-parrot outline-none"
+                          />
                         </div>
                       </div>
-                    </>
+
+                      <div className="grid grid-cols-2 gap-3">
+                        <label className="block text-xs font-semibold text-slate">
+                          Your UPI ID
+                          <input
+                            value={upiId}
+                            onChange={(e) => setUpiId(e.target.value)}
+                            placeholder="user@okaxis"
+                            className="mt-1 w-full h-10 rounded-xl bg-mint px-3 font-mono text-xs text-ink border border-transparent focus:border-parrot outline-none"
+                          />
+                        </label>
+                        <label className="block text-xs font-semibold text-slate">
+                          Emergency Contact
+                          <input
+                            value={emergencyPhone}
+                            onChange={(e) =>
+                              setEmergencyPhone(
+                                e.target.value
+                                  .replace(/\D/g, "")
+                                  .slice(0, 10),
+                              )
+                            }
+                            placeholder="98XXXXXX00"
+                            className="mt-1 w-full h-10 rounded-xl bg-mint px-3 font-mono text-xs text-ink border border-transparent focus:border-parrot outline-none"
+                          />
+                        </label>
+                      </div>
+                    </div>
                   ) : (
-                    <>
-                      <div className="pt-2 border-t border-line space-y-3">
-                        <p className="text-xs font-bold uppercase tracking-wider text-parrot-ink">
-                          Home Socket & Tariff Details
-                        </p>
-                        <label className="block text-xs font-semibold text-slate">
-                          Home / Driveway Listing Title
+                    <div className="pt-2 border-t border-line space-y-3">
+                      <p className="text-xs font-bold uppercase tracking-wider text-parrot-ink">
+                        Home Socket & Charging Details (Select or Type)
+                      </p>
+                      <label className="block text-xs font-semibold text-slate">
+                        Home / Driveway Listing Title
+                        <input
+                          value={homeTitle}
+                          onChange={(e) => setHomeTitle(e.target.value)}
+                          placeholder="e.g. Sharma Villa Solar Socket"
+                          className="mt-1 w-full h-10 rounded-xl bg-mint px-3 text-sm text-ink border border-transparent focus:border-parrot outline-none"
+                        />
+                      </label>
+                      <label className="block text-xs font-semibold text-slate">
+                        Sector / Locality
+                        <input
+                          value={locality}
+                          onChange={(e) => setLocality(e.target.value)}
+                          placeholder="e.g. Sector 62, Noida"
+                          className="mt-1 w-full h-10 rounded-xl bg-mint px-3 text-sm text-ink border border-transparent focus:border-parrot outline-none"
+                        />
+                      </label>
+
+                      <div>
+                        <span className="block text-xs font-semibold text-slate mb-1.5">
+                          Installed Socket / Charger Type (Select or Type)
+                        </span>
+                        <div className="grid grid-cols-3 gap-1.5 mb-2">
+                          {[
+                            ["15A Plug", 3.3],
+                            ["7.2kW Fast", 7.2],
+                            ["11kW AC", 11],
+                          ].map(([st, kw]) => (
+                            <button
+                              key={st}
+                              type="button"
+                              onClick={() => {
+                                setSocketType(st)
+                                setPowerKw(kw)
+                              }}
+                              className={`h-8 px-2 rounded-xl text-[11px] font-display font-bold border truncate ${
+                                socketType === st
+                                  ? "bg-parrot/20 border-parrot text-ink"
+                                  : "bg-mint border-transparent text-slate"
+                              }`}
+                            >
+                              {st}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="grid grid-cols-2 gap-2">
                           <input
-                            value={homeTitle}
-                            onChange={(e) => setHomeTitle(e.target.value)}
-                            className="mt-1 w-full h-10 rounded-xl bg-mint px-3 text-sm text-ink border border-transparent focus:border-parrot outline-none"
+                            value={socketType}
+                            onChange={(e) => setSocketType(e.target.value)}
+                            placeholder="Type socket type..."
+                            className="w-full h-10 rounded-xl bg-mint px-3 text-xs text-ink border border-line focus:border-parrot outline-none"
                           />
-                        </label>
-                        <label className="block text-xs font-semibold text-slate">
-                          Sector / Locality
                           <input
-                            value={locality}
-                            onChange={(e) => setLocality(e.target.value)}
-                            className="mt-1 w-full h-10 rounded-xl bg-mint px-3 text-sm text-ink border border-transparent focus:border-parrot outline-none"
+                            type="number"
+                            step="0.1"
+                            value={powerKw}
+                            onChange={(e) => setPowerKw(e.target.value)}
+                            placeholder="Power (kW)"
+                            className="w-full h-10 rounded-xl bg-mint px-3 font-mono text-xs text-ink border border-line focus:border-parrot outline-none"
                           />
-                        </label>
-                        <div className="grid grid-cols-2 gap-3">
-                          <label className="block text-xs font-semibold text-slate">
-                            Tariff Rate (₹/kWh)
-                            <input
-                              type="number"
-                              min="5"
-                              max="30"
-                              value={ratePerKwh}
-                              onChange={(e) => setRatePerKwh(e.target.value)}
-                              className="mt-1 w-full h-10 rounded-xl bg-mint px-3 font-mono text-sm text-ink border border-transparent focus:border-parrot outline-none"
-                            />
-                          </label>
-                          <label className="block text-xs font-semibold text-slate">
-                            Host Payout UPI ID
-                            <input
-                              value={upiId}
-                              onChange={(e) => setUpiId(e.target.value)}
-                              placeholder="host@okicici"
-                              className="mt-1 w-full h-10 rounded-xl bg-mint px-3 font-mono text-xs text-ink border border-transparent focus:border-parrot outline-none"
-                            />
-                          </label>
                         </div>
                       </div>
-                    </>
+
+                      <div className="grid grid-cols-2 gap-3">
+                        <label className="block text-xs font-semibold text-slate">
+                          Tariff Rate (₹/kWh)
+                          <input
+                            type="number"
+                            min="1"
+                            max="50"
+                            value={ratePerKwh}
+                            onChange={(e) => setRatePerKwh(e.target.value)}
+                            className="mt-1 w-full h-10 rounded-xl bg-mint px-3 font-mono text-sm text-ink border border-transparent focus:border-parrot outline-none"
+                          />
+                        </label>
+                        <label className="block text-xs font-semibold text-slate">
+                          Available Timing
+                          <input
+                            value={availabilitySlot}
+                            onChange={(e) =>
+                              setAvailabilitySlot(e.target.value)
+                            }
+                            placeholder="e.g. 24×7 or 8AM–10PM"
+                            className="mt-1 w-full h-10 rounded-xl bg-mint px-3 text-xs text-ink border border-transparent focus:border-parrot outline-none"
+                          />
+                        </label>
+                      </div>
+
+                      <label className="block text-xs font-semibold text-slate">
+                        Host Payout UPI ID
+                        <input
+                          value={upiId}
+                          onChange={(e) => setUpiId(e.target.value)}
+                          placeholder="host@okicici"
+                          className="mt-1 w-full h-10 rounded-xl bg-mint px-3 font-mono text-xs text-ink border border-transparent focus:border-parrot outline-none"
+                        />
+                      </label>
+                    </div>
                   )}
 
+                  {/* PERKS: Quick Select + Type Custom Perk */}
                   <div>
                     <span className="block text-xs font-semibold text-slate mb-1.5">
                       {role === "driver"
                         ? "Preferred Safety & Hospitality Perks"
                         : "Hospitality Perks Offered"}
                     </span>
-                    <div className="grid grid-cols-2 gap-1.5">
-                      {ALL_PERKS.map((p) => (
+                    <div className="grid grid-cols-2 gap-1.5 mb-2">
+                      {displayedPerks.map((p) => (
                         <button
                           key={p}
                           type="button"
                           onClick={() => togglePerk(p)}
-                          className={`h-9 px-2.5 rounded-xl text-xs font-display font-bold border flex items-center gap-1.5 ${
+                          className={`h-8 px-2.5 rounded-xl text-xs font-display font-bold border flex items-center gap-1.5 ${
                             perks.includes(p)
                               ? "bg-parrot/20 border-parrot text-ink"
                               : "bg-mint border-transparent text-slate"
@@ -828,10 +1087,38 @@ function SideDrawer({
                         </button>
                       ))}
                     </div>
+                    <div className="flex gap-1.5">
+                      <input
+                        value={customPerkInput}
+                        onChange={(e) => setCustomPerkInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault()
+                            handleAddCustomPerk()
+                          }
+                        }}
+                        placeholder="Type custom perk (e.g. WiFi, Air Pump, Guard)..."
+                        className="flex-1 h-9 rounded-xl bg-mint px-3 text-xs text-ink border border-line focus:border-parrot outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleAddCustomPerk}
+                        className="h-9 px-3 rounded-xl bg-mint-2 hover:bg-parrot/30 text-xs font-display font-bold text-ink inline-flex items-center gap-1 shrink-0"
+                      >
+                        <Plus size={13} /> Add
+                      </button>
+                    </div>
                   </div>
 
-                  <Btn type="submit" icon={Save} className="w-full">
-                    Save All Profile Details
+                  <Btn
+                    type="submit"
+                    icon={savingBackend ? Loader2 : Save}
+                    disabled={savingBackend}
+                    className="w-full"
+                  >
+                    {savingBackend
+                      ? "Saving to Backend…"
+                      : "Save All Profile Details"}
                   </Btn>
                 </form>
               )}
@@ -978,7 +1265,6 @@ function SideDrawer({
               {/* ================= TAB 3: EV TOOLKIT ================= */}
               {activeSection === "toolkit" && (
                 <div className="space-y-4">
-                  {/* Tool 1: Charge Time & Bill Estimator */}
                   <div className="rounded-2xl border border-line p-4 space-y-3 bg-mint/40">
                     <div className="flex items-center gap-2 text-parrot-ink">
                       <Zap size={16} />
@@ -1053,7 +1339,6 @@ function SideDrawer({
                     </div>
                   </div>
 
-                  {/* Tool 2: Green Impact Passbook */}
                   <div className="rounded-2xl border border-line p-4 space-y-2.5">
                     <div className="flex items-center gap-2 text-parrot-ink">
                       <Leaf size={16} />
@@ -1077,7 +1362,6 @@ function SideDrawer({
                     </div>
                   </div>
 
-                  {/* Tool 3: Safety & Emergency SOS */}
                   <div className="rounded-2xl border border-line p-4 space-y-2.5">
                     <div className="flex items-center gap-2 text-parrot-ink">
                       <ShieldCheck size={16} />
@@ -1600,6 +1884,37 @@ function Portal({ onLogout }) {
   const role = state.session.role
   const demo = state.session.demo
   const tab = role === "host" ? state.hostTab : state.driverTab
+
+  // Fetch saved photo from Supabase Storage Bucket ('avatars') & user_metadata whenever Portal opens
+  useEffect(() => {
+    if (!isLive || demo || !supabase?.auth?.getUser) return
+    let active = true
+
+    ;(async () => {
+      try {
+        const { data } = await supabase.auth.getUser()
+        const uid = data?.user?.id || state.session.userId
+        const meta = data?.user?.user_metadata || {}
+        const bucketPhoto = uid ? await fetchAvatarFromBucket(uid) : ""
+        if (!active) return
+
+        dispatch({
+          type: "HYDRATE_BACKEND_PROFILE",
+          meta: {
+            ...meta,
+            photoUrl:
+              bucketPhoto || meta.avatarUrl || meta.photoUrl || "",
+          },
+          email: data?.user?.email,
+        })
+      } catch {}
+    })()
+
+    return () => {
+      active = false
+    }
+  }, [state.session.userId, demo])
+
   const goDriver = async (h) => {
     dispatch({ type: "SET_ROLE", role: "driver" })
     dispatch({ type: "TAB", role: "driver", tab: "find" })
@@ -1677,7 +1992,6 @@ function Shell() {
     if (isLive) probeBackend()
   }, [])
 
-  // Handle redirect when user clicks the Supabase verification link in their email
   useEffect(() => {
     if (!isLive) return
     let mounted = true
@@ -1693,6 +2007,7 @@ function Shell() {
             name: user.name || "Verified User",
             phone: user.phone || "",
             userId: user.id,
+            photoUrl: user.photoUrl || "",
             onboarding: user.onboarding,
             x: window.innerWidth / 2,
             y: window.innerHeight / 2,
@@ -1730,7 +2045,13 @@ function Shell() {
         password,
         onboarding,
       })
-      return { userId: user.id, name: user.name, phone: user.phone }
+      return {
+        userId: user.id,
+        name: user.name,
+        phone: user.phone,
+        email,
+        photoUrl: user.photoUrl || "",
+      }
     } catch (e) {
       toast("Couldn't sign you in", e?.message || "Please try again.", {
         tone: "error",
@@ -1781,22 +2102,33 @@ function Shell() {
       window.removeEventListener("plughome:session-expired", onExpired)
   }, [])
 
-  const enter = ({ role, name, phone, x, y, userId, onboarding }) => {
+  const enter = ({
+    role,
+    name,
+    phone,
+    email,
+    photoUrl,
+    x,
+    y,
+    userId,
+    onboarding,
+  }) => {
     setWipe({
       x: x ?? window.innerWidth / 2,
       y: y ?? window.innerHeight / 2,
       phase: "in",
     })
     setTimeout(() => {
-      dispatch({ type: "LOGIN", role, name, phone, userId })
-      if (onboarding) {
-        dispatch({
-          type: "UPDATE_PROFILE",
-          ...(role === "host"
-            ? { hostDetails: onboarding }
-            : { driverDetails: onboarding }),
-        })
-      }
+      dispatch({
+        type: "LOGIN",
+        role,
+        name,
+        phone,
+        email,
+        photoUrl,
+        userId,
+        onboarding,
+      })
       if (role === "driver" && onboarding?.currentSoc) {
         dispatch({ type: "SOC", soc: onboarding.currentSoc })
       }

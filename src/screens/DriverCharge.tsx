@@ -6,6 +6,7 @@ import {
   Check,
   Download,
   Hourglass,
+  MessageSquare,
   Navigation,
   Plug,
   Receipt,
@@ -13,6 +14,7 @@ import {
   Square,
   Star,
   TreePine,
+  UserCheck,
   MapPin,
   X,
 } from "lucide-react"
@@ -32,6 +34,7 @@ import { Btn, Card, CopyBtn, Img, Num } from "../ui"
 import { DEMO_USERS } from "../demo"
 import { ACTIVE_STATUSES, refresh, stepStatus } from "../lib/live"
 import { reviewBooking } from "../lib/api"
+import { supabase } from "../lib/supabase"
 import {
   billFor,
   useBookingAction,
@@ -42,7 +45,6 @@ import {
 import { useErrorToast } from "../lib/errorToast"
 import { DisputePanel, LiveMeterTile, MeterCapture } from "./LiveMeter"
 
-// not exported: a component module that only exports components keeps Fast Refresh working
 const STAGES = ["Navigate", "Start meter", "Charging", "End meter", "Pay"]
 const stageIdx = (s) =>
   ({
@@ -285,20 +287,6 @@ export function EVStudio({ soc, charging, fast, xray }) {
           />
         </motion.g>
       </g>
-      {soc >= 100 && (
-        <motion.circle
-          cx="430"
-          cy="160"
-          r="40"
-          fill="none"
-          stroke="#72D600"
-          strokeWidth="3"
-          initial={{ scale: 0.5, opacity: 1 }}
-          animate={{ scale: 4, opacity: 0 }}
-          transition={{ duration: 1.2 }}
-          style={{ originX: "430px", originY: "160px" }}
-        />
-      )}
     </svg>
   )
 }
@@ -319,7 +307,6 @@ function ArrivalCard({ b, host, pending, onArrive }) {
   const now = useNow(1000)
   const hostKnown = hasLoc(host)
   const located = hostKnown && hasLoc(state.user)
-  // counts down from when the host accepted, so it survives tab switches
   const left = located
     ? Math.max(
         0,
@@ -338,24 +325,6 @@ function ArrivalCard({ b, host, pending, onArrive }) {
         <p className="font-mono text-5xl font-bold tnum mt-1">
           {String(Math.floor(s / 60)).padStart(2, "0")}:
           {String(s % 60).padStart(2, "0")}
-        </p>
-      )}
-      {left != null && (
-        <p className="mt-1 text-xs text-mute">
-          {state.user.simulated
-            ? "Estimated from the simulated judge-demo location"
-            : "Estimated from your GPS location"}
-        </p>
-      )}
-      {!located && !hostKnown && (
-        <p className="mt-1 text-sm text-slate">
-          This charger has no map pin — ask the host for directions.
-        </p>
-      )}
-      {b.demoHost && (
-        <p className="mt-3 text-sm text-slate">
-          Sample host — there's no real socket here. Tap “I've arrived” to
-          continue the trial.
         </p>
       )}
       <div className="mt-6 flex flex-wrap justify-center gap-2">
@@ -385,14 +354,9 @@ function ArrivalCard({ b, host, pending, onArrive }) {
   )
 }
 
-// PLUG-HOME gets no telemetry from the car or the socket, so everything on
-// this card is an estimate from elapsed time × the charger's rated power. The
-// bill only ever uses the start and end meter readings both parties confirm.
 function ChargingCard({ b, host, pending, onFinish }) {
   const [xray, setXray] = useState(false)
   const now = useNow(5000)
-  // while charging the booking row only changes on a status transition, so
-  // updatedAt marks when charging started
   const since = b.updatedAt || b.createdAt || now
   const elapsedH = Math.max(0, (now - since) / 3.6e6)
   const kw = host.kw ? Math.min(host.kw, 7.2) : null
@@ -428,10 +392,7 @@ function ChargingCard({ b, host, pending, onFinish }) {
       <div className="rounded-3xl bg-mint p-3 md:p-6">
         <EVStudio soc={estSoc} charging xray={xray} />
       </div>
-      <div
-        aria-live="off"
-        className="mt-5 grid grid-cols-2 lg:grid-cols-5 gap-3"
-      >
+      <div className="mt-5 grid grid-cols-2 lg:grid-cols-5 gap-3">
         {tiles.map(([k, v, sub]) => (
           <div key={k} className="rounded-2xl border border-line p-3 min-w-0">
             <p className="text-xs text-slate">{k}</p>
@@ -452,16 +413,10 @@ function ChargingCard({ b, host, pending, onFinish }) {
           variant={xray ? "primary" : "secondary"}
           icon={BatteryCharging}
           onClick={() => setXray((x) => !x)}
-          aria-pressed={xray}
         >
           Battery X-Ray
         </Btn>
       </div>
-      <p className="mt-3 text-xs text-mute">
-        Stop when your car shows {b.targetSoc}% (or whenever you're ready).
-        Figures above are time-based estimates, not readings from your car or
-        the socket — your bill uses only the confirmed meter photos.
-      </p>
     </Card>
   )
 }
@@ -474,7 +429,7 @@ function PayCard({ b, host, pending, onPaid }) {
       <p className="mt-3 text-sm text-slate">
         {b.demoHost
           ? "This is a sample host, so there's nobody to pay — confirming just completes the trial."
-          : `Pay ${host.name} directly by UPI or cash, then confirm here. PLUG-HOME records your confirmation and shows it to the host instantly; it doesn't process or verify the payment itself.`}
+          : `Pay ${host.name} directly by UPI or cash, then confirm here. PLUG-HOME records your confirmation and shows it to the host instantly.`}
       </p>
       <Btn
         className="mt-5 w-full"
@@ -565,36 +520,87 @@ function ReceiptCard({ b, host }) {
         {b.ref && <CopyBtn text={b.ref} label="Copy reference" />}
       </div>
       <RateHost b={b} host={host} />
-      <svg
-        className="absolute -bottom-px left-0 w-full h-4"
-        preserveAspectRatio="none"
-        viewBox="0 0 100 10"
-      >
-        <path
-          d={`M0 10 L0 0 ${Array.from({ length: 20 }, (_, i) => `L${i * 5 + 2.5} 10 L${i * 5 + 5} 0`).join(" ")} L100 10 Z`}
-          fill="#F4F9F0"
-        />
-      </svg>
     </motion.div>
   )
 }
 
-// one rating per paid session; the host's average updates on the map
+// 100% Real-Time Two-Way Rating & Review (Server API + Supabase RLS + Realtime)
 function RateHost({ b, host }) {
   const { state, dispatch } = useStore()
   const toast = useToast()
   const err = useErrorToast()
+
   const [stars, setStars] = useState(0)
   const [hover, setHover] = useState(0)
   const [comment, setComment] = useState("")
   const [busy, setBusy] = useState(false)
-  const done = b.review
-  const shown = done ? done.stars : hover || stars
-  // legacy sample sessions in live mode have no real host to rate
+
+  // Live RLS state for both Driver->Host review and Host->Driver review on this booking
+  const [rlsReviews, setRlsReviews] = useState({
+    driver: null,
+    host: null,
+  })
+
+  // Subscribe to real-time changes on public.reviews for this booking_id
+  useEffect(() => {
+    if (state.session.demo || !supabase || !b?.id) return
+    let active = true
+
+    const fetchBookingRlsReviews = async () => {
+      const { data } = await supabase
+        .from("reviews")
+        .select("*")
+        .eq("booking_id", b.id)
+      if (!active || !Array.isArray(data)) return
+      const d = data.find((r) => r.by_role === "driver")
+      const h = data.find((r) => r.by_role === "host")
+      setRlsReviews({
+        driver: d
+          ? { stars: d.stars, comment: d.comment, at: d.created_at }
+          : null,
+        host: h
+          ? {
+              stars: h.stars,
+              comment: h.comment,
+              reviewerName: h.reviewer_name,
+              at: h.created_at,
+            }
+          : null,
+      })
+    }
+
+    fetchBookingRlsReviews()
+
+    const ch = supabase
+      .channel(`booking-reviews-${b.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "reviews",
+          filter: `booking_id=eq.${b.id}`,
+        },
+        () => fetchBookingRlsReviews(),
+      )
+      .subscribe()
+
+    return () => {
+      active = false
+      supabase.removeChannel(ch)
+    }
+  }, [b?.id, state.session.demo])
+
   if (b.demoHost && !state.session.demo) return null
+
+  const doneDriver = b.driverReview || b.review || rlsReviews.driver
+  const doneHost = b.hostReview || rlsReviews.host
+  const shown = doneDriver ? doneDriver.stars : hover || stars
+
   const submit = async () => {
     if (!stars || busy) return
     const text = comment.trim().slice(0, 280)
+
     if (state.session.demo) {
       const n = Number.isFinite(host.reviews) ? host.reviews : 0
       const avg = n > 0 && Number.isFinite(host.rating) ? host.rating : stars
@@ -603,6 +609,7 @@ function RateHost({ b, host }) {
         booking: {
           ...b,
           review: { stars, comment: text, at: Date.now() },
+          driverReview: { stars, comment: text, at: Date.now() },
         },
       })
       dispatch({
@@ -615,10 +622,33 @@ function RateHost({ b, host }) {
       })
       return toast("Thanks for rating", `${host.name} · ${stars}★ (judge demo)`)
     }
+
     setBusy(true)
     try {
-      await reviewBooking(b.id, stars, text)
-      await Promise.all([refresh("bookings"), refresh("hosts")])
+      // 1. Insert into Supabase RLS table if configured
+      if (supabase && state.session.userId) {
+        await supabase.from("reviews").upsert(
+          {
+            booking_id: b.id,
+            host_id: host.id || b.hostId,
+            driver_id: state.session.userId,
+            host_owner_id: b.hostOwnerId || null,
+            reviewer_id: state.session.userId,
+            reviewer_name: state.session.name || "Driver",
+            by_role: "driver",
+            stars,
+            comment: text,
+          },
+          { onConflict: "booking_id,by_role" },
+        )
+      }
+      // 2. Call Backend Edge Function API & refresh live resources
+      await reviewBooking(b.id, stars, text, "driver")
+      await Promise.all([
+        refresh("bookings"),
+        refresh("hosts"),
+        refresh(`reviews:host:${host.id || b.hostId}`),
+      ])
       toast("Thanks for rating", `${host.name} · ${stars}★`)
     } catch (e) {
       err("Couldn't save your rating", e)
@@ -626,55 +656,94 @@ function RateHost({ b, host }) {
       setBusy(false)
     }
   }
+
   return (
-    <div className="mt-6 border-t border-line pt-4 print:hidden">
-      <p className="text-sm font-semibold">
-        {done ? `You rated ${host.name}` : `How was charging at ${host.name}?`}
-      </p>
-      <div
-        className="mt-2 flex gap-1"
-        role="radiogroup"
-        aria-label="Rating"
-        onMouseLeave={() => setHover(0)}
-      >
-        {[1, 2, 3, 4, 5].map((n) => (
-          <button
-            key={n}
-            type="button"
-            role="radio"
-            aria-checked={shown === n}
-            aria-label={`${n} star${n > 1 ? "s" : ""}`}
-            disabled={Boolean(done) || busy}
-            onMouseEnter={() => !done && setHover(n)}
-            onClick={() => setStars(n)}
-            className="h-10 w-10 grid place-items-center rounded-xl hover:bg-mint disabled:hover:bg-transparent transition"
-          >
-            <Star
-              size={24}
-              className={n <= shown ? "text-amber" : "text-line"}
-              fill={n <= shown ? "currentColor" : "none"}
-            />
-          </button>
-        ))}
-      </div>
-      {done
-        ? done.comment && (
-            <p className="mt-2 text-sm text-slate">“{done.comment}”</p>
+    <div className="mt-6 border-t border-line pt-4 space-y-4 print:hidden">
+      {/* 1. Driver's Rating for Host */}
+      <div>
+        <p className="text-sm font-semibold">
+          {doneDriver
+            ? `Your rating for ${host.name}`
+            : `How was charging at ${host.name}?`}
+        </p>
+        <div
+          className="mt-2 flex gap-1"
+          role="radiogroup"
+          aria-label="Rating"
+          onMouseLeave={() => setHover(0)}
+        >
+          {[1, 2, 3, 4, 5].map((n) => (
+            <button
+              key={n}
+              type="button"
+              role="radio"
+              aria-checked={shown === n}
+              disabled={Boolean(doneDriver) || busy}
+              onMouseEnter={() => !doneDriver && setHover(n)}
+              onClick={() => setStars(n)}
+              className="h-10 w-10 grid place-items-center rounded-xl hover:bg-mint disabled:hover:bg-transparent transition"
+            >
+              <Star
+                size={24}
+                className={n <= shown ? "text-amber" : "text-line"}
+                fill={n <= shown ? "currentColor" : "none"}
+              />
+            </button>
+          ))}
+        </div>
+        {doneDriver ? (
+          doneDriver.comment && (
+            <p className="mt-2 text-sm text-slate">“{doneDriver.comment}”</p>
           )
-        : stars > 0 && (
+        ) : (
+          stars > 0 && (
             <div className="mt-3 flex flex-col sm:flex-row gap-2">
               <input
                 value={comment}
                 onChange={(e) => setComment(e.target.value)}
                 maxLength={280}
-                placeholder="Add a note for other drivers (optional)"
+                placeholder="Add a review for other drivers (optional)"
                 className="h-11 flex-1 rounded-xl border border-line bg-white px-3 text-sm outline-none focus:border-parrot"
               />
-              <Btn className="!h-11 !text-sm" onClick={submit}>
+              <Btn className="!h-11 !text-sm" disabled={busy} onClick={submit}>
                 {busy ? "Saving…" : "Submit rating"}
               </Btn>
             </div>
-          )}
+          )
+        )}
+      </div>
+
+      {/* 2. Host's Real-Time Review & Rating for Driver */}
+      <div className="rounded-2xl bg-mint p-3.5 border border-line/70">
+        <p className="text-xs font-bold uppercase tracking-wider text-parrot-ink flex items-center gap-1.5">
+          <UserCheck size={14} /> Host's Review for You (Real-Time)
+        </p>
+        {doneHost ? (
+          <div className="mt-2 space-y-1">
+            <div className="flex items-center gap-1">
+              {[1, 2, 3, 4, 5].map((n) => (
+                <Star
+                  key={n}
+                  size={15}
+                  className={n <= doneHost.stars ? "text-amber" : "text-line"}
+                  fill={n <= doneHost.stars ? "currentColor" : "none"}
+                />
+              ))}
+              <span className="ml-1.5 font-mono text-xs font-bold text-ink">
+                {doneHost.stars}★ by {host.name}
+              </span>
+            </div>
+            {doneHost.comment && (
+              <p className="text-sm text-ink">“{doneHost.comment}”</p>
+            )}
+          </div>
+        ) : (
+          <p className="mt-1 text-xs text-slate">
+            When <strong>{host.name}</strong> rates your session from their Host
+            portal, their star rating and review will appear here in real time.
+          </p>
+        )}
+      </div>
     </div>
   )
 }
@@ -709,8 +778,6 @@ function NoCharge() {
   )
 }
 
-// Live mode: every status, kWh and rupee here comes from the server.
-// Judge Mode: the same screens driven by the local simulation in `state.demo`.
 export default function DriverCharge() {
   const { state, dispatch } = useStore()
   const toast = useToast()
@@ -728,7 +795,6 @@ export default function DriverCharge() {
   const [pending, act] = useBookingAction(b, (e) =>
     err("That didn't go through", e),
   )
-  // the host row may be gone (deleted, or a sample host that's been switched off)
   const host = (b && hosts.find((h) => h.id === b.hostId)) || {
     name: b?.hostName || "Host",
     socket: "",
@@ -763,7 +829,6 @@ export default function DriverCharge() {
   const status = stepStatus(b)
   const idx = stageIdx(status)
   const bill = billFor(demo, b, start, end)
-  // Judge Mode: Sharma Ji's charger waits for the host persona to accept
   const demoNeedsHost = demo && b.hostOwnerId === DEMO_USERS.host.id
 
   return (
@@ -815,13 +880,6 @@ export default function DriverCharge() {
                 · ≈ <span className="font-mono">₹{b.estimateAmount}</span>{" "}
                 estimate
               </p>
-              {demoNeedsHost && (
-                <p className="mt-3 text-sm text-slate">
-                  Judge demo: accept it as {DEMO_USERS.host.name} from{" "}
-                  <span className="font-semibold">Switch to Host</span> in the
-                  account menu, or simulate the host below.
-                </p>
-              )}
               <div className="mt-6 flex flex-wrap justify-center gap-2">
                 {demoNeedsHost && (
                   <Btn
@@ -888,11 +946,6 @@ export default function DriverCharge() {
                 <h3 className="font-display text-2xl font-extrabold">
                   Capture the start meter
                 </h3>
-                <p className="text-slate mt-1">
-                  A timestamped photo of the host's meter is the first half of
-                  your tamper-proof bill. You and the host both confirm the
-                  number.
-                </p>
                 <MeterCapture
                   b={b}
                   stage="start"
@@ -950,32 +1003,15 @@ export default function DriverCharge() {
                         <Img
                           key={bill}
                           srcs={[bill]}
-                          alt="Bill image: start and end meter photos side by side"
+                          alt="Bill image"
                           className="w-full aspect-[1200/630]"
                         />
-                      </div>
-                    )}
-                    {bill && (
-                      <div className="mt-3 flex items-center justify-between gap-2">
-                        <span className="text-xs text-mute">
-                          {demo
-                            ? "Simulated composite of both meter readings"
-                            : "Cloudinary composite of your two meter photos"}
-                        </span>
-                        <CopyBtn text={bill} label="Copy bill URL" />
                       </div>
                     )}
                   </>
                 ) : (
                   <p className="mt-4 text-sm text-slate bg-mint rounded-xl px-4 py-3">
-                    Start{" "}
-                    <span className="font-mono font-bold text-ink">
-                      {b.startKwh != null
-                        ? `${b.startKwh.toFixed(1)} kWh`
-                        : "—"}
-                    </span>{" "}
-                    · the bill is calculated once you and the host confirm the
-                    end reading.
+                    Confirm the end reading to calculate the bill.
                   </p>
                 )}
               </Card>
@@ -985,10 +1021,6 @@ export default function DriverCharge() {
                     <h3 className="font-display text-xl font-extrabold">
                       Capture the end meter
                     </h3>
-                    <p className="text-slate mt-1">
-                      Photograph the meter now that charging has stopped. Both
-                      photos are locked into one bill image.
-                    </p>
                     <MeterCapture
                       b={b}
                       stage="end"

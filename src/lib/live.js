@@ -9,13 +9,14 @@ import { supabase, getLiveUser, isLive } from "./supabase"
 import {
   fetchBookings,
   fetchConfig,
+  fetchDriverReviews,
   fetchHosts,
   fetchReadings,
+  fetchReviews,
   fetchStats,
 } from "./api"
 import { clearSigned, rememberSigned, setCloud } from "./cloudinary"
 
-// ---------- backend probe ----------
 let probe = null
 let backendConfig = null
 export const getBackendConfig = () => backendConfig
@@ -35,7 +36,6 @@ export function probeBackend() {
   return probe
 }
 
-// ---------- row mappers (server row → the UI's existing object shapes) ----------
 const num = (v, d = 0) => (typeof v === "number" && Number.isFinite(v) ? v : d)
 const url = (v) => (typeof v === "string" && v ? v : null)
 const STATUS = {
@@ -60,7 +60,6 @@ export const ACTIVE_STATUSES = [
 ]
 const DAY = 86400000
 
-// UI step for the stepper; a dispute pauses on the stage it happened at
 export const stepStatus = (b) =>
   b?.status === "disputed"
     ? b.disputeStage === "end"
@@ -76,7 +75,6 @@ export function rowToHost(r) {
     name: r.name || "Home socket",
     ownerId: r.ownerId,
     ownerName: r.ownerName || null,
-    // legacy seeded sample row: never shown in live mode (see `listable`)
     demo: Boolean(r.demo),
     ownerInitials: r.ownerInitials || "PH",
     lat: num(r.lat, NaN),
@@ -86,15 +84,12 @@ export function rowToHost(r) {
     kw: num(r.kw, 3.3),
     rate: num(r.rate, 12),
     perks: Array.isArray(r.perks) ? r.perks : [],
-    // no reviews yet = no rating (the UI shows "New"), never a made-up score
     rating: reviews > 0 ? num(r.rating, null) : null,
     reviews,
     online: Boolean(r.online),
     isNew: !r.demo && Date.now() - num(r.createdAt) < DAY,
     mediaPublicId: r.mediaPublicId || null,
     mediaType: r.mediaType || null,
-    // the server's signed URL for private Storage media; used when the
-    // cached first URL (cloudinary.js) is missing, so media is never hidden
     mediaUrl: url(r.mediaUrl),
     createdAt: num(r.createdAt),
   }
@@ -110,6 +105,11 @@ export function rowToBooking(r) {
     driverId: r.driverId,
     demoHost: Boolean(r.demoHost),
     driver: r.driverName || "Driver",
+    driverRating: r.driverRating == null ? null : num(r.driverRating),
+    driverReviewsCount: num(r.driverReviewsCount, 0),
+    driverPastReviews: Array.isArray(r.driverPastReviews)
+      ? r.driverPastReviews
+      : [],
     car: r.car || "EV",
     status: STATUS[r.status] || r.status,
     rawStatus: r.status,
@@ -126,8 +126,10 @@ export function rowToBooking(r) {
     ref: r.ref || null,
     paidAt: r.paidAt || null,
     disputeStage: r.disputeStage || null,
-    // the driver's rating for a paid session, once given
+    // In index.tsx: `review` = Driver's rating of Host, `driverReview` = Host's rating of Driver
     review: r.review || null,
+    driverReview: r.review || null,
+    hostReview: r.driverReview || null,
     createdAt: num(r.createdAt),
     updatedAt: num(r.updatedAt),
   }
@@ -150,10 +152,22 @@ export function rowToReading(r) {
   }
 }
 
-// ---------- shared resource cache ----------
-// One fetch + one subscription per resource no matter how many components use
-// it. Data only ever comes from the server (initial GET, realtime-triggered
-// re-fetch, or a host row pushed by the server).
+export function rowToReview(r) {
+  if (!r) return null
+  return {
+    id: `${r.bookingId || ""}-${r.at || Date.now()}`,
+    bookingId: r.bookingId || null,
+    hostId: r.hostId || null,
+    driverId: r.driverId || null,
+    driverName: r.driverName || "EV Driver",
+    hostName: r.hostName || "Host",
+    stars: num(r.stars, 5),
+    tags: Array.isArray(r.tags) ? r.tags : [],
+    comment: r.comment || "",
+    at: num(r.at, Date.now()),
+  }
+}
+
 const EMPTY = { data: undefined, loading: false, error: null }
 const resources = new Map()
 let generation = 0
@@ -228,9 +242,6 @@ export function resetLive() {
   clearSigned()
 }
 
-// Judge Mode gate: while a local demo session is open no live resource,
-// fetch, poll or realtime channel may start — even if the browser still holds
-// a Supabase session from earlier.
 let judgeMode = false
 export function setJudgeMode(on) {
   judgeMode = Boolean(on)
@@ -260,13 +271,10 @@ function useResource(key, fetcher) {
   return useSyncExternalStore(subscribe, () => (r ? r.snap : EMPTY))
 }
 
-// ---------- realtime (broadcast) ----------
 const HOSTS_TOPIC = "plughome-hosts"
 const userTopic = (id) => `plughome-user-${id}`
 const channels = new Map()
 
-// Connection status for the navbar pill: "live" once every joined channel is
-// subscribed, "connecting" while any is joining, erroring or timed out.
 let rtStatus = "connecting"
 const rtListeners = new Set()
 function updateRtStatus() {
@@ -300,7 +308,6 @@ function joinTopic(topic, fn) {
       c.state = status
       updateRtStatus()
       if (status !== "SUBSCRIBED") return
-      // after a reconnect anything may have changed — re-sync once
       if (c.joined) c.handlers.forEach((h) => h({ event: "resync" }))
       c.joined = true
     })
@@ -328,9 +335,6 @@ function useTopic(topic, handler) {
   }, [topic])
 }
 
-// Safety net when a broadcast is missed: refetch on focus / reconnect, plus a
-// poll while the tab is visible — every 60 s while realtime is connected,
-// every 10 s while it isn't.
 if (typeof window !== "undefined") {
   const onVisible = () =>
     document.visibilityState === "visible" && refreshActive()
@@ -342,8 +346,6 @@ if (typeof window !== "undefined") {
       return
     if (rtStatus !== "live" || ++tick % 6 === 0) refreshActive()
   }, 10000)
-  // dev hot-reload: tear down this copy's timers, listeners and channels so
-  // the re-evaluated module doesn't stack duplicates on the shared client
   import.meta.hot?.dispose(() => {
     clearInterval(poll)
     window.removeEventListener("online", refreshActive)
@@ -353,11 +355,9 @@ if (typeof window !== "undefined") {
   })
 }
 
-// ---------- hooks ----------
 const NO_HOSTS = []
 const NO_BOOKINGS = []
-// schema guarantees coordinates; drop anything malformed rather than invent a
-// spot, and never list a legacy sample row as if it were a real charger
+const NO_REVIEWS = []
 const listable = (h) =>
   !h.demo && Number.isFinite(h.lat) && Number.isFinite(h.lng)
 
@@ -403,6 +403,45 @@ export function useBookings(enabled = true) {
   }
 }
 
+export function useHostReviews(hostId, enabled = true) {
+  const key = enabled && liveOn() && hostId ? `reviews:host:${hostId}` : null
+  const snap = useResource(key, async () => {
+    const res = await fetchReviews(hostId)
+    return (res?.reviews || []).map(rowToReview).filter(Boolean)
+  })
+  useTopic(key && HOSTS_TOPIC, (m) => {
+    if (m.event === "host" || m.event === "resync") {
+      refresh(`reviews:host:${hostId}`)
+    }
+  })
+  return {
+    reviews: snap.data || NO_REVIEWS,
+    loading: Boolean(key) && snap.loading && !snap.data,
+    error: snap.error,
+    refresh: () => key && refresh(key),
+  }
+}
+
+export function useDriverReviews(driverId, enabled = true) {
+  const key =
+    enabled && liveOn() && driverId ? `reviews:driver:${driverId}` : null
+  const snap = useResource(key, async () => {
+    const res = await fetchDriverReviews(driverId)
+    return (res?.reviews || []).map(rowToReview).filter(Boolean)
+  })
+  useTopic(key && userTopic(driverId), (m) => {
+    if (m.event === "booking" || m.event === "resync") {
+      refresh(`reviews:driver:${driverId}`)
+    }
+  })
+  return {
+    reviews: snap.data || NO_REVIEWS,
+    loading: Boolean(key) && snap.loading && !snap.data,
+    error: snap.error,
+    refresh: () => key && refresh(key),
+  }
+}
+
 export function useMeterReadings(bookingId, enabled = true) {
   const uid = enabled && liveOn() ? getLiveUser()?.id : null
   const key = uid && bookingId ? `readings:${bookingId}` : null
@@ -439,10 +478,6 @@ export function useHostStats(userId, enabled = true) {
   }
 }
 
-// ---------- action helper ----------
-// Fires a server action and shows a pending label until the watched value
-// (usually the booking's status) changes via realtime. Never trusts the HTTP
-// response for UI state; re-fetches after 4 s and gives up after 15 s.
 export function usePendingAction(watch, onError) {
   const [pending, setPending] = useState(null)
   useEffect(() => {
@@ -457,7 +492,6 @@ export function usePendingAction(watch, onError) {
       clearTimeout(b)
     }
   }, [pending])
-  // resolves true on success so callers can follow up (toasts etc.)
   const run = async (label, fn) => {
     if (pending) return false
     setPending({ label, watch })

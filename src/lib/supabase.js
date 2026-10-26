@@ -9,11 +9,29 @@ import {
 
 export { isLive }
 
+const AVATAR_KEY = "plughome:saved_avatar"
+export const AVATAR_BUCKET = "avatars"
+
+export function saveAvatarPersistent(dataUrl) {
+  if (typeof window === "undefined") return
+  try {
+    if (dataUrl) localStorage.setItem(AVATAR_KEY, dataUrl)
+    else if (dataUrl === "") localStorage.removeItem(AVATAR_KEY)
+  } catch {}
+}
+
+export function getSavedAvatar() {
+  if (typeof window === "undefined") return ""
+  try {
+    return localStorage.getItem(AVATAR_KEY) || ""
+  } catch {
+    return ""
+  }
+}
+
 const shared = (globalThis.__plughomeSupabase ??= { client: null, user: null })
 
 if (isLive && !shared.client) {
-  // Enable detectSessionInUrl & persistSession so clicking the Supabase
-  // verification email link automatically authenticates the redirected tab.
   shared.client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     auth: {
       persistSession: true,
@@ -29,13 +47,164 @@ if (isLive && !shared.client) {
   })
 }
 
+// Intercept updateUser: strip large base64 data URLs from JWT, but KEEP short https:// Supabase Bucket URLs!
+if (shared.client?.auth && !shared.client.auth.__patched) {
+  const origUpdateUser = shared.client.auth.updateUser.bind(shared.client.auth)
+  shared.client.auth.updateUser = async (attributes, options) => {
+    if (attributes?.data && "photoUrl" in attributes.data) {
+      const val = attributes.data.photoUrl
+      if (val) {
+        saveAvatarPersistent(val)
+      } else if (val === "") {
+        saveAvatarPersistent("")
+      }
+      const isHttpUrl =
+        typeof val === "string" &&
+        (val.startsWith("http://") || val.startsWith("https://"))
+      attributes = {
+        ...attributes,
+        data: {
+          ...attributes.data,
+          // Keep https:// bucket URL in user_metadata; only strip large base64 strings
+          photoUrl: isHttpUrl ? val : val === "" ? "" : null,
+          avatarUrl: isHttpUrl ? val : val === "" ? "" : attributes.data.avatarUrl,
+        },
+      }
+    }
+    return origUpdateUser(attributes, options)
+  }
+  shared.client.auth.__patched = true
+}
+
 export const supabase = isLive ? shared.client : null
 export const getLiveUser = () => shared.user
+
+// Ensure 'avatars' bucket exists (if permissions allow) and upload profile photo blob
+export async function uploadAvatarToBucket(userId, blobOrFile) {
+  if (!supabase || !userId || !blobOrFile) return null
+  const cleanId = String(userId).trim()
+  const filePath = `${cleanId}/avatar.jpg`
+
+  try {
+    await supabase.storage.createBucket(AVATAR_BUCKET, { public: true })
+  } catch {}
+
+  const { error: uploadError } = await supabase.storage
+    .from(AVATAR_BUCKET)
+    .upload(filePath, blobOrFile, {
+      upsert: true,
+      contentType: "image/jpeg",
+      cacheControl: "0",
+    })
+
+  if (uploadError) {
+    throw new ApiError(
+      uploadError.message ||
+        "Could not upload to 'avatars' bucket. Make sure the 'avatars' bucket is created and public in Supabase.",
+    )
+  }
+
+  const { data } = supabase.storage.from(AVATAR_BUCKET).getPublicUrl(filePath)
+  const publicUrl = data?.publicUrl
+    ? `${data.publicUrl}?t=${Date.now()}`
+    : null
+
+  if (publicUrl) {
+    saveAvatarPersistent(publicUrl)
+    try {
+      await supabase.auth.updateUser({
+        data: { photoUrl: publicUrl, avatarUrl: publicUrl },
+      })
+    } catch {}
+  }
+
+  return publicUrl
+}
+
+// Fetch user's profile photo directly from Supabase Storage bucket ('avatars')
+export async function fetchAvatarFromBucket(userId) {
+  if (!supabase || !userId) return ""
+  const cleanId = String(userId).trim()
+  const filePath = `${cleanId}/avatar.jpg`
+
+  try {
+    // 1. Check user_metadata first for saved bucket URL
+    const { data: userData } = await supabase.auth.getUser()
+    const meta = userData?.user?.user_metadata || {}
+    const metaUrl = meta.avatarUrl || meta.photoUrl
+    if (
+      typeof metaUrl === "string" &&
+      (metaUrl.startsWith("http://") || metaUrl.startsWith("https://"))
+    ) {
+      saveAvatarPersistent(metaUrl)
+      return metaUrl
+    }
+
+    // 2. Otherwise check the 'avatars' bucket folder directly for avatar.jpg
+    const { data: files, error } = await supabase.storage
+      .from(AVATAR_BUCKET)
+      .list(cleanId, { limit: 10 })
+
+    if (!error && Array.isArray(files)) {
+      const found = files.find((f) => f.name === "avatar.jpg" || f.name.startsWith("avatar"))
+      if (found) {
+        const { data } = supabase.storage
+          .from(AVATAR_BUCKET)
+          .getPublicUrl(`${cleanId}/${found.name}`)
+        if (data?.publicUrl) {
+          const versionTag = found.updated_at
+            ? new Date(found.updated_at).getTime()
+            : Date.now()
+          const finalUrl = `${data.publicUrl}?t=${versionTag}`
+          saveAvatarPersistent(finalUrl)
+          return finalUrl
+        }
+      }
+    }
+  } catch {}
+
+  return getSavedAvatar() || ""
+}
+
+// Delete user's profile photo from Supabase Storage bucket ('avatars')
+export async function removeAvatarFromBucket(userId) {
+  saveAvatarPersistent("")
+  if (!supabase || !userId) return
+  const cleanId = String(userId).trim()
+  try {
+    await supabase.storage.from(AVATAR_BUCKET).remove([`${cleanId}/avatar.jpg`])
+  } catch {}
+  try {
+    await supabase.auth.updateUser({
+      data: { photoUrl: "", avatarUrl: "" },
+    })
+  } catch {}
+}
 
 export async function getToken() {
   if (!supabase) return null
   const { data } = await supabase.auth.getSession()
-  return data?.session?.access_token ?? null
+  const session = data?.session
+  if (!session) return null
+
+  const existingMetaPhoto =
+    session.user?.user_metadata?.avatarUrl ||
+    session.user?.user_metadata?.photoUrl
+  if (existingMetaPhoto && String(existingMetaPhoto).length > 15) {
+    saveAvatarPersistent(existingMetaPhoto)
+  }
+
+  if (session.access_token && session.access_token.length > 3500) {
+    try {
+      await supabase.auth.updateUser({ data: { photoUrl: null } })
+      const refreshed = await supabase.auth.refreshSession()
+      if (refreshed?.data?.session?.access_token) {
+        return refreshed.data.session.access_token
+      }
+    } catch {}
+  }
+
+  return session.access_token ?? null
 }
 
 const PENDING_KEY = "plughome:pending_email_verify"
@@ -74,10 +243,17 @@ export function clearPendingVerification() {
   } catch {}
 }
 
-// Syncs the authenticated Supabase user with the PLUG-HOME edge backend (/auth/profile)
 async function finalizeSessionUser(session, fallback = {}) {
   const meta = session?.user?.user_metadata || {}
-  const name = fallback.name || meta.full_name || "EV User"
+  const bucketPhoto = await fetchAvatarFromBucket(session?.user?.id)
+  const resolvedPhoto =
+    bucketPhoto || meta.avatarUrl || meta.photoUrl || getSavedAvatar() || ""
+
+  if (resolvedPhoto) {
+    saveAvatarPersistent(resolvedPhoto)
+  }
+
+  const name = fallback.name || meta.name || meta.full_name || "EV User"
   const role = fallback.role || meta.role || "driver"
   const phone = fallback.phone || meta.phone || ""
   const onboarding =
@@ -86,15 +262,15 @@ async function finalizeSessionUser(session, fallback = {}) {
     getSavedOnboarding(session.user.id, role) ||
     {}
 
+  const token = (await getToken()) || session.access_token
+
   try {
     await request("/auth/profile", {
       method: "POST",
-      token: session.access_token,
+      token,
       body: { name, role },
     })
-  } catch {
-    /* non-blocking if edge profile sync is already up to date */
-  }
+  } catch {}
 
   try {
     localStorage.setItem(
@@ -115,12 +291,12 @@ async function finalizeSessionUser(session, fallback = {}) {
     role,
     phone,
     email: session.user.email,
+    photoUrl: resolvedPhoto,
     onboarding,
   }
   return shared.user
 }
 
-// Step 1: Triggers real Supabase Verification Email on Sign-Up
 export async function startEmailSignUp({
   name,
   role,
@@ -170,7 +346,6 @@ export async function startEmailSignUp({
     throw new ApiError(error.message || "Couldn't send verification email.")
   }
 
-  // If Supabase returns an active session immediately (when "Confirm email" is off in dashboard)
   if (data?.session) {
     const user = await finalizeSessionUser(data.session, {
       name,
@@ -181,14 +356,12 @@ export async function startEmailSignUp({
     return { status: "verified", user }
   }
 
-  // Otherwise, Supabase has sent the verification link to the user's email
   return {
     status: "awaiting_verification",
     email: cleanEmail,
   }
 }
 
-// Step 2: Checks if the user clicked the verification link in their email
 export async function checkEmailVerificationStatus({
   email,
   password,
@@ -227,7 +400,6 @@ export async function checkEmailVerificationStatus({
   return { verified: false }
 }
 
-// Step 3: Resend verification email
 export async function resendVerificationMail(email) {
   if (!supabase) throw new ApiError("Live mode is not configured.")
   const redirectUrl =
@@ -248,7 +420,6 @@ export async function resendVerificationMail(email) {
   return true
 }
 
-// Step 4: Standard Sign-In for already verified accounts
 export async function signInAs({
   name,
   role,
@@ -288,7 +459,6 @@ export async function signInAs({
   })
 }
 
-// Step 5: Detects when the user lands back on the website after clicking the email link
 export async function checkEmailRedirectCallback() {
   if (!supabase || typeof window === "undefined") return null
 
@@ -308,7 +478,6 @@ export async function checkEmailRedirectCallback() {
   const pending = getPendingVerification() || {}
   const user = await finalizeSessionUser(data.session, pending)
 
-  // Clean URL hash/query after capturing session
   try {
     window.history.replaceState({}, document.title, window.location.pathname)
   } catch {}
