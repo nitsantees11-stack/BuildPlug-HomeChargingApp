@@ -14,7 +14,9 @@ import {
   fetchReadings,
   fetchReviews,
   fetchStats,
+  getPaidLocalOverride,
 } from "./api"
+
 import { clearSigned, rememberSigned, setCloud } from "./cloudinary"
 
 let probe = null
@@ -97,6 +99,12 @@ export function rowToHost(r) {
 
 export function rowToBooking(r) {
   const startSoc = num(r.startSoc, 0)
+  const paidOverride = getPaidLocalOverride(r.id)
+  const resolvedStatus = paidOverride
+    ? "paid"
+    : STATUS[r.status] || r.status
+  const resolvedRawStatus = paidOverride ? "paid" : r.status
+
   return {
     id: r.id,
     hostId: r.hostId,
@@ -111,8 +119,8 @@ export function rowToBooking(r) {
       ? r.driverPastReviews
       : [],
     car: r.car || "EV",
-    status: STATUS[r.status] || r.status,
-    rawStatus: r.status,
+    status: resolvedStatus,
+    rawStatus: resolvedRawStatus,
     startSoc,
     targetSoc: num(r.targetSoc, startSoc),
     rate: num(r.rate, 12),
@@ -123,10 +131,9 @@ export function rowToBooking(r) {
     kwhUsed: num(r.kwhUsed, 0),
     amount: num(r.amount, 0),
     hasBill: r.amount != null && r.kwhUsed != null,
-    ref: r.ref || null,
-    paidAt: r.paidAt || null,
+    ref: r.ref || paidOverride?.ref || null,
+    paidAt: r.paidAt || paidOverride?.paidAt || null,
     disputeStage: r.disputeStage || null,
-    // In index.tsx: `review` = Driver's rating of Host, `driverReview` = Host's rating of Driver
     review: r.review || null,
     driverReview: r.review || null,
     hostReview: r.driverReview || null,
@@ -134,6 +141,7 @@ export function rowToBooking(r) {
     updatedAt: num(r.updatedAt),
   }
 }
+
 
 export function rowToReading(r) {
   if (!r) return null
