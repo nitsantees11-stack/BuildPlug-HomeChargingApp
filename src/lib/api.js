@@ -1,22 +1,65 @@
 import { ApiError, request } from "./config"
 import { getToken, supabase } from "./supabase"
 
-const HOST_PHOTO_CACHE_KEY = "plughome:host_photos"
+const LEGACY_KEY = "plughome:host_photos" // old shared key (the bug) - removed automatically
+const KEY_PREFIX = "plughome:host_photos:" // new key: one cache per signed-in user
+
+// who is signed in right now, read from Supabase's own session in localStorage
+function currentUid() {
+  if (typeof window === "undefined") return null
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i)
+      if (k && k.startsWith("sb-") && k.endsWith("-auth-token")) {
+        const id = JSON.parse(localStorage.getItem(k) || "null")?.user?.id
+        if (id) return id
+      }
+    }
+  } catch {}
+  return null
+}
+
+// drop the old shared cache and any other user's cache
+function purgeForeignPhotoCaches(uid) {
+  try {
+    const drop = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i)
+      if (!k) continue
+      if (k === LEGACY_KEY) drop.push(k)
+      else if (k.startsWith(KEY_PREFIX) && k !== KEY_PREFIX + uid) drop.push(k)
+    }
+    drop.forEach((k) => localStorage.removeItem(k))
+  } catch {}
+}
+
+// call this on logout too
+export function clearPhotoCaches() {
+  try {
+    Object.keys(localStorage)
+      .filter((k) => k === LEGACY_KEY || k.startsWith(KEY_PREFIX))
+      .forEach((k) => localStorage.removeItem(k))
+  } catch {}
+}
 
 export function saveHostPhotoCache(hostKey, photoData) {
-  if (typeof window === "undefined" || !hostKey || !photoData) return
+  const uid = currentUid()
+  if (typeof window === "undefined" || !uid || !hostKey || !photoData) return
+  purgeForeignPhotoCaches(uid)
   try {
-    const raw = localStorage.getItem(HOST_PHOTO_CACHE_KEY)
+    const raw = localStorage.getItem(KEY_PREFIX + uid)
     const map = raw ? JSON.parse(raw) : {}
     map[hostKey] = photoData
-    localStorage.setItem(HOST_PHOTO_CACHE_KEY, JSON.stringify(map))
+    localStorage.setItem(KEY_PREFIX + uid, JSON.stringify(map))
   } catch {}
 }
 
 export function getHostPhotoCache() {
-  if (typeof window === "undefined") return {}
+  const uid = currentUid()
+  if (typeof window === "undefined" || !uid) return {} // not signed in = no cache
+  purgeForeignPhotoCaches(uid)
   try {
-    const raw = localStorage.getItem(HOST_PHOTO_CACHE_KEY)
+    const raw = localStorage.getItem(KEY_PREFIX + uid)
     return raw ? JSON.parse(raw) : {}
   } catch {
     return {}
