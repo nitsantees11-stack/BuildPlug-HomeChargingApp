@@ -763,7 +763,6 @@ function HostMedia({ host }) {
   const upload = async (file) => {
     if (!file || progress != null) return
     if (state.session.demo) {
-      // Judge Mode: the file stays on this device as an object URL
       revokeDemoMedia(host.mediaUrl)
       dispatch({
         type: "DEMO_HOST",
@@ -778,17 +777,34 @@ function HostMedia({ host }) {
         "Shown on your charger card — kept on this device only.",
       )
     }
-    setProgress(1)
+    setProgress(10)
+    // Also upload to Supabase Bucket & local cache so host photo never disappears
+    uploadMediaToBucket("hosts", host.id, file).then((bucketUrl) => {
+      if (bucketUrl) {
+        saveHostPhotoCache(host.id, {
+          mediaUrl: bucketUrl,
+          mediaType: file.type.startsWith("video") ? "video" : "image",
+        })
+      }
+    })
     try {
-      await uploadToCloudinary({
+      const res = await uploadToCloudinary({
         file,
         purpose: "host_media",
         hostId: host.id,
         onProgress: setProgress,
       })
+      if (res?.mediaUrl || res?.secure_url || res?.url) {
+        saveHostPhotoCache(host.id, {
+          mediaUrl: res.mediaUrl || res.secure_url || res.url,
+          mediaPublicId: res.mediaPublicId || res.public_id || null,
+          mediaType: file.type.startsWith("video") ? "video" : "image",
+        })
+      }
       await refresh("hosts")
       toast("Media added", "Drivers now see it on your charger card.")
     } catch (e) {
+      await refresh("hosts")
       err("Media upload failed", e, () => upload(file))
     } finally {
       setProgress(null)
@@ -834,29 +850,6 @@ function HostMedia({ host }) {
       )}
     </div>
   )
-}
-
-const LIVE_LINE = {
-  accepted: () => "Accepted · driver is on the way",
-  startMeter: (b) =>
-    `Driver arrived · confirm the start meter · ${b.startSoc}→${b.targetSoc}%`,
-  charging: (b) =>
-    `Charging · ${b.startSoc}→${b.targetSoc}% · start ${b.startKwh?.toFixed(1)} kWh`,
-  endMeter: (b) =>
-    `Charging finished · confirm the end meter · start ${b.startKwh?.toFixed(1)} kWh`,
-  awaitingPay: (b) =>
-    `${(b.kwhUsed ?? 0).toFixed(1)} kWh · ₹${b.amount} · driver pays you directly (UPI or cash)`,
-  disputed: () => "Meter readings differ · compare both photos",
-}
-// Judge Mode: steps only the driver can take, for the simulated drivers
-const DEMO_DRIVER_STEP = {
-  accepted: ["Simulate driver arriving", "arrive", "Driver arrived"],
-  charging: [
-    "Simulate driver stopping",
-    "finish_charging",
-    "Charging finished",
-  ],
-  awaitingPay: ["Simulate driver paying", "mark_paid", "Payment received"],
 }
 
 function LiveHostBooking({ b, i }) {
@@ -986,7 +979,37 @@ function LiveHostBooking({ b, i }) {
                   : "Synced live with the driver"}
               </span>
             </div>
-            {driverStep && (
+
+            {/* HOST-ONLY STOP CHARGING BUTTON */}
+            {b.status === "charging" && (
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-parrot/40 bg-white p-4">
+                <div className="text-xs text-slate">
+                  <p className="font-display font-bold text-sm text-ink">
+                    Host Charging Control
+                  </p>
+                  <p>
+                    Stop the session when the vehicle reaches target charge to
+                    capture the end meter.
+                  </p>
+                </div>
+                <Btn
+                  icon={Zap}
+                  disabled={!!pending}
+                  onClick={() =>
+                    act("Stopping…", "finish_charging", () =>
+                      toast(
+                        "Charging stopped by Host",
+                        "Now capture & confirm the end meter reading.",
+                      ),
+                    )
+                  }
+                >
+                  {pending || "Stop charging & capture end meter"}
+                </Btn>
+              </div>
+            )}
+
+            {driverStep && b.status !== "charging" && (
               <Btn
                 variant="secondary"
                 className="mt-3 !h-11 !text-sm"
@@ -1004,6 +1027,8 @@ function LiveHostBooking({ b, i }) {
                 <LiveMeterTile
                   label={b.status === "startMeter" ? "START" : "END"}
                   reading={b.status === "startMeter" ? start : end}
+                  bookingId={b.id}
+                  stage={b.status === "startMeter" ? "start" : "end"}
                 />
                 <div>
                   <p className="font-display font-bold">
@@ -1032,17 +1057,19 @@ function LiveHostBooking({ b, i }) {
         )}
         {(b.status === "paid" || b.status === "awaitingPay") && (
           <div className="mt-4 grid grid-cols-[1fr_1fr_auto] gap-3 items-center">
-            <Img
-              key={start?.publicId || start?.localUrl || "s"}
-              srcs={meterSrcs(start, `START ${b.startKwh?.toFixed(1)} kWh`)}
-              alt="Start meter snapshot"
-              className="rounded-xl aspect-[3/2] w-full"
+            <LiveMeterTile
+              label="START"
+              reading={start}
+              kwh={b.startKwh}
+              bookingId={b.id}
+              stage="start"
             />
-            <Img
-              key={end?.publicId || end?.localUrl || "e"}
-              srcs={meterSrcs(end, `END ${b.endKwh?.toFixed(1)} kWh`)}
-              alt="End meter snapshot"
-              className="rounded-xl aspect-[3/2] w-full"
+            <LiveMeterTile
+              label="END"
+              reading={end}
+              kwh={b.endKwh}
+              bookingId={b.id}
+              stage="end"
             />
             <div className="text-right">
               <p className="font-mono text-xs text-slate">
@@ -1077,6 +1104,7 @@ function LiveHostBooking({ b, i }) {
     </motion.div>
   )
 }
+
 
 export function HostBookings() {
   const { state } = useStore()

@@ -354,7 +354,7 @@ function ArrivalCard({ b, host, pending, onArrive }) {
   )
 }
 
-function ChargingCard({ b, host, pending, onFinish }) {
+function ChargingCard({ b, host }) {
   const [xray, setXray] = useState(false)
   const now = useNow(5000)
   const since = b.updatedAt || b.createdAt || now
@@ -405,10 +405,14 @@ function ChargingCard({ b, host, pending, onFinish }) {
           </div>
         ))}
       </div>
-      <div className="mt-5 flex flex-wrap gap-2">
-        <Btn icon={Square} disabled={!!pending} onClick={onFinish}>
-          {pending || "Stop charging & capture end meter"}
-        </Btn>
+      <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
+        <div className="rounded-2xl bg-mint px-4 py-2.5 text-xs md:text-sm font-semibold text-ink flex items-center gap-2 border border-line">
+          <span className="h-2.5 w-2.5 rounded-full bg-parrot animate-pulse shrink-0" />
+          <span>
+            Charging active — Host (<strong>{host.name}</strong>) will stop
+            charging &amp; unlock the end meter.
+          </span>
+        </div>
         <Btn
           variant={xray ? "primary" : "secondary"}
           icon={BatteryCharging}
@@ -420,6 +424,7 @@ function ChargingCard({ b, host, pending, onFinish }) {
     </Card>
   )
 }
+
 
 function PayCard({ b, host, pending, onPaid }) {
   return (

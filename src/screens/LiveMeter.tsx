@@ -1,6 +1,4 @@
 // @ts-nocheck
-// Live-mode meter proof: real camera/file input → signed Cloudinary upload →
-// OCR prefill → each party confirms → the server decides (confirmed/disputed).
 import { useEffect, useRef, useState } from "react"
 import { AnimatePresence, motion } from "framer-motion"
 import {
@@ -15,7 +13,13 @@ import { useStore, useToast } from "../store"
 import { Btn, Card, Img } from "../ui"
 import { round1 } from "../lib"
 import { demoMeterStart, demoReading } from "../demo"
-import { bookingAction, confirmReading } from "../lib/api"
+import {
+  bookingAction,
+  confirmReading,
+  getMeterPhotoCache,
+  saveMeterPhotoCache,
+  uploadMediaToBucket,
+} from "../lib/api"
 import { uploadToCloudinary } from "../lib/upload"
 import { refresh, useBookings, usePendingAction } from "../lib/live"
 import { meterSrcs } from "../lib/data"
@@ -36,7 +40,49 @@ const kwhText = (v) =>
         maximumFractionDigits: 1,
       })
 
-export function LiveMeterTile({ label, reading, kwh }) {
+// Compress meter photo to a compact DataURL backup so it never shows "No meter photo yet"
+function fileToCompactDataUrl(file, maxDim = 480) {
+  return new Promise((resolve) => {
+    try {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const img = new Image()
+        img.onload = () => {
+          const canvas = document.createElement("canvas")
+          let w = img.width
+          let h = img.height
+          if (w > h && w > maxDim) {
+            h = Math.round((h * maxDim) / w)
+            w = maxDim
+          } else if (h >= w && h > maxDim) {
+            w = Math.round((w * maxDim) / h)
+            h = maxDim
+          }
+          canvas.width = w
+          canvas.height = h
+          canvas.getContext("2d").drawImage(img, 0, 0, w, h)
+          resolve(canvas.toDataURL("image/jpeg", 0.78))
+        }
+        img.onerror = () => resolve(null)
+        img.src = reader.result
+      }
+      reader.onerror = () => resolve(null)
+      reader.readAsDataURL(file)
+    } catch {
+      resolve(null)
+    }
+  })
+}
+
+export function LiveMeterTile({ label, reading, kwh, bookingId, stage }) {
+  const resolvedStage =
+    stage || reading?.stage || (label === "END" ? "end" : "start")
+  const resolvedBookingId = bookingId || reading?.bookingId
+  const cachedPhoto =
+    resolvedBookingId && resolvedStage
+      ? getMeterPhotoCache(resolvedBookingId, resolvedStage)
+      : null
+
   const value =
     kwh ??
     reading?.driverValue ??
@@ -44,12 +90,18 @@ export function LiveMeterTile({ label, reading, kwh }) {
     reading?.ocrKwh ??
     reading?.suggested ??
     null
-  const id = reading?.publicId || reading?.localUrl
-  // live: Cloudinary / signed Storage URL · Judge Mode: on-device SVG
-  const srcs = meterSrcs(
+
+  const directUrl = reading?.photoUrl || reading?.localUrl || cachedPhoto || null
+  const id = reading?.publicId || directUrl
+
+  const baseSrcs = meterSrcs(
     reading,
     value != null ? `${label} ${value.toFixed(1)} kWh` : label,
   )
+  const srcs = Array.from(
+    new Set([directUrl, ...(baseSrcs || []), cachedPhoto].filter(Boolean)),
+  )
+
   return (
     <div className="rounded-2xl overflow-hidden border border-line bg-white">
       <div className="relative aspect-[3/2] bg-mint">
@@ -58,7 +110,7 @@ export function LiveMeterTile({ label, reading, kwh }) {
             key={id}
             srcs={srcs}
             alt={`${label} meter`}
-            className="h-full w-full"
+            className="h-full w-full object-cover"
           />
         ) : (
           <div className="absolute inset-0 grid place-items-center p-4 text-center">
@@ -84,7 +136,7 @@ export function LiveMeterTile({ label, reading, kwh }) {
             <span className="text-mute font-normal">
               {reading?.simulated
                 ? "Simulated meter · judge demo"
-                : id
+                : id || value != null
                   ? "OCR unavailable — entered manually"
                   : "Photo required"}
             </span>
@@ -103,25 +155,40 @@ export function MeterCapture({ b, stage, reading, party }) {
   const fileRef = useRef(null)
   const [progress, setProgress] = useState(null)
   const [thumb, setThumb] = useState(null)
+  const [localPhoto, setLocalPhoto] = useState(() =>
+    getMeterPhotoCache(b?.id, stage),
+  )
   const [value, setValue] = useState("")
+
   const mine = party === "driver" ? reading?.driverValue : reading?.hostValue
   const theirs = party === "driver" ? reading?.hostValue : reading?.driverValue
   const other = party === "driver" ? "host" : "driver"
-  const photo = reading?.publicId || reading?.localUrl || null
-  // prefill from the server's OCR (or my earlier entry, or the simulated
-  // meter in Judge Mode) whenever a new photo lands
+  const photo =
+    reading?.publicId ||
+    reading?.photoUrl ||
+    reading?.localUrl ||
+    localPhoto ||
+    null
+
+  useEffect(() => {
+    const cached = getMeterPhotoCache(b?.id, stage)
+    if (cached && !localPhoto) setLocalPhoto(cached)
+  }, [b?.id, stage])
+
   useEffect(() => {
     setValue(
-      photo ? String(mine ?? reading.ocrKwh ?? reading.suggested ?? "") : "",
+      photo
+        ? String(mine ?? reading?.ocrKwh ?? reading?.suggested ?? value ?? "")
+        : "",
     )
-  }, [photo])
+  }, [photo, mine, reading?.ocrKwh])
+
   useEffect(() => () => thumb && URL.revokeObjectURL(thumb), [thumb])
   const watch = `${b.rawStatus}|${reading?.publicId}|${reading?.driverValue}|${reading?.hostValue}`
   const [pending, run] = usePendingAction(watch, (e) =>
     err("Couldn't confirm the reading", e),
   )
 
-  // Judge Mode: a simulated meter photo, generated on this device
   const simulate = () => {
     if (progress != null) return
     setProgress(40)
@@ -142,10 +209,25 @@ export function MeterCapture({ b, stage, reading, party }) {
       toast("Simulated meter photo", "Check the reading, then confirm it.")
     }, 600)
   }
+
   const upload = async (file) => {
     if (!file || progress != null) return
     setThumb(URL.createObjectURL(file))
-    setProgress(1)
+    setProgress(10)
+
+    // 1. Immediately save compact backup & Supabase Bucket URL so photo never vanishes
+    const compactUrl = await fileToCompactDataUrl(file)
+    if (compactUrl) {
+      saveMeterPhotoCache(b.id, stage, compactUrl)
+      setLocalPhoto(compactUrl)
+    }
+    uploadMediaToBucket("meters", `${b.id}-${stage}`, file).then((bucketUrl) => {
+      if (bucketUrl) {
+        saveMeterPhotoCache(b.id, stage, bucketUrl)
+        setLocalPhoto(bucketUrl)
+      }
+    })
+
     try {
       await uploadToCloudinary({
         file,
@@ -158,12 +240,21 @@ export function MeterCapture({ b, stage, reading, party }) {
       await refresh(`readings:${b.id}`)
       toast("Meter photo uploaded", "Check the reading, then confirm it.")
     } catch (e) {
-      err("Meter photo upload failed", e, () => upload(file))
+      // Even if Cloudinary/OCR server had an issue, allow manual reading confirmation using the saved photo
+      if (compactUrl) {
+        toast(
+          "Photo saved — enter meter reading",
+          "Type the kWh shown on the meter and confirm.",
+        )
+      } else {
+        err("Meter photo upload failed", e, () => upload(file))
+      }
     } finally {
       setProgress(null)
       setThumb(null)
     }
   }
+
   const n = Number(value)
   const valid = value !== "" && Number.isFinite(n) && n > 0
   const confirm = () => {
@@ -174,7 +265,6 @@ export function MeterCapture({ b, stage, reading, party }) {
         `It can't be below the start reading (${kwhText(b.startKwh)} kWh).`,
         { tone: "warn" },
       )
-    // the simulated other party confirms the same number
     dispatch({
       type: "DEMO_ACTION",
       id: b.id,
@@ -270,9 +360,9 @@ export function MeterCapture({ b, stage, reading, party }) {
                   />
                 </label>
                 <p className="mt-1.5 text-xs text-mute">
-                  {reading.simulated
+                  {reading?.simulated
                     ? "Pre-filled from the simulated meter — edit it to try a different reading."
-                    : reading.ocrKwh != null
+                    : reading?.ocrKwh != null
                       ? "Pre-filled from OCR — fix it if the photo says otherwise."
                       : "OCR could not read this photo — type the number shown on the meter."}
                 </p>
@@ -355,8 +445,19 @@ export function DisputePanel({ b, start, end, party, photos = true }) {
       </p>
       {photos && (
         <div className="mt-4 grid grid-cols-2 gap-3">
-          <LiveMeterTile label="START" reading={start} kwh={b.startKwh} />
-          <LiveMeterTile label="END" reading={end} />
+          <LiveMeterTile
+            label="START"
+            reading={start}
+            kwh={b.startKwh}
+            bookingId={b.id}
+            stage="start"
+          />
+          <LiveMeterTile
+            label="END"
+            reading={end}
+            bookingId={b.id}
+            stage="end"
+          />
         </div>
       )}
       <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
@@ -400,6 +501,10 @@ const DRIVER_MSG = {
     "Start meter verified",
     `${kwhText(b.startKwh)} kWh · charging started`,
   ],
+  endMeter: () => [
+    "Host stopped charging",
+    "Capture or confirm the end meter reading.",
+  ],
   awaitingPay: (b) => [
     "Bill ready",
     `${kwhText(b.kwhUsed)} kWh · ₹${b.amount}`,
@@ -430,7 +535,6 @@ const HOST_MSG = {
   ],
 }
 
-// Announces server-driven booking changes (from the other window/party).
 export function LiveNotifier() {
   const { state } = useStore()
   const toast = useToast()

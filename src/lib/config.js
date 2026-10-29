@@ -20,10 +20,7 @@ export class ApiError extends Error {
   }
 }
 
-export async function request(
-  path,
-  { method = "GET", body, token, timeout = 20000 } = {},
-) {
+async function singleFetch(path, { method, body, token, timeout }) {
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), timeout)
   try {
@@ -47,18 +44,40 @@ export async function request(
         data,
       )
     return data
-  } catch (e) {
-    if (e instanceof ApiError) throw e
-    if (e?.name === "AbortError")
-      throw new ApiError(
-        "The server took too long to respond — please try again.",
-      )
-    throw new ApiError(
-      typeof navigator !== "undefined" && navigator.onLine === false
-        ? "You're offline — check your connection and try again."
-        : "Couldn't reach the PLUG-HOME server.",
-    )
   } finally {
     clearTimeout(t)
+  }
+}
+
+export async function request(
+  path,
+  { method = "GET", body, token, timeout = 25000 } = {},
+) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await singleFetch(path, { method, body, token, timeout })
+    } catch (e) {
+      if (e instanceof ApiError) {
+        // Retry once on 502/503/504 gateway cold starts
+        if (attempt === 0 && [502, 503, 504].includes(e.status)) {
+          await new Promise((res) => setTimeout(res, 800))
+          continue
+        }
+        throw e
+      }
+      if (attempt === 0) {
+        await new Promise((res) => setTimeout(res, 800))
+        continue
+      }
+      if (e?.name === "AbortError")
+        throw new ApiError(
+          "The server took too long to respond — please try again.",
+        )
+      throw new ApiError(
+        typeof navigator !== "undefined" && navigator.onLine === false
+          ? "You're offline — check your connection and try again."
+          : "Couldn't reach the PLUG-HOME server.",
+      )
+    }
   }
 }

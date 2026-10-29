@@ -14,9 +14,9 @@ import {
   fetchReadings,
   fetchReviews,
   fetchStats,
-  getPaidLocalOverride,
+  getHostPhotoCache,
+  getMeterPhotoCache,
 } from "./api"
-
 import { clearSigned, rememberSigned, setCloud } from "./cloudinary"
 
 let probe = null
@@ -70,7 +70,21 @@ export const stepStatus = (b) =>
     : b?.status
 
 export function rowToHost(r) {
-  rememberSigned(r.mediaPublicId, r.mediaUrl)
+  const hostCache = getHostPhotoCache()
+  const cachedEntry =
+    hostCache[r.id] ||
+    hostCache[r.ownerId] ||
+    hostCache[(r.name || "").trim().toLowerCase()] ||
+    null
+  const cachedUrl =
+    typeof cachedEntry === "string"
+      ? cachedEntry
+      : cachedEntry?.mediaUrl || cachedEntry?.url || null
+
+  const resolvedMediaUrl = url(r.mediaUrl) || url(cachedUrl)
+  const resolvedPublicId = r.mediaPublicId || cachedEntry?.mediaPublicId || null
+
+  rememberSigned(resolvedPublicId, resolvedMediaUrl)
   const reviews = num(r.reviews, 0)
   return {
     id: r.id,
@@ -90,21 +104,15 @@ export function rowToHost(r) {
     reviews,
     online: Boolean(r.online),
     isNew: !r.demo && Date.now() - num(r.createdAt) < DAY,
-    mediaPublicId: r.mediaPublicId || null,
-    mediaType: r.mediaType || null,
-    mediaUrl: url(r.mediaUrl),
+    mediaPublicId: resolvedPublicId,
+    mediaType: r.mediaType || cachedEntry?.mediaType || (resolvedMediaUrl ? "image" : null),
+    mediaUrl: resolvedMediaUrl,
     createdAt: num(r.createdAt),
   }
 }
 
 export function rowToBooking(r) {
   const startSoc = num(r.startSoc, 0)
-  const paidOverride = getPaidLocalOverride(r.id)
-  const resolvedStatus = paidOverride
-    ? "paid"
-    : STATUS[r.status] || r.status
-  const resolvedRawStatus = paidOverride ? "paid" : r.status
-
   return {
     id: r.id,
     hostId: r.hostId,
@@ -119,8 +127,8 @@ export function rowToBooking(r) {
       ? r.driverPastReviews
       : [],
     car: r.car || "EV",
-    status: resolvedStatus,
-    rawStatus: resolvedRawStatus,
+    status: STATUS[r.status] || r.status,
+    rawStatus: r.status,
     startSoc,
     targetSoc: num(r.targetSoc, startSoc),
     rate: num(r.rate, 12),
@@ -131,8 +139,8 @@ export function rowToBooking(r) {
     kwhUsed: num(r.kwhUsed, 0),
     amount: num(r.amount, 0),
     hasBill: r.amount != null && r.kwhUsed != null,
-    ref: r.ref || paidOverride?.ref || null,
-    paidAt: r.paidAt || paidOverride?.paidAt || null,
+    ref: r.ref || null,
+    paidAt: r.paidAt || null,
     disputeStage: r.disputeStage || null,
     review: r.review || null,
     driverReview: r.review || null,
@@ -142,21 +150,27 @@ export function rowToBooking(r) {
   }
 }
 
+export function rowToReading(r, fallbackBookingId = null, fallbackStage = null) {
+  const bId = r?.bookingId || fallbackBookingId
+  const stg = r?.stage || fallbackStage
+  const cachedPhoto = bId && stg ? getMeterPhotoCache(bId, stg) : null
 
-export function rowToReading(r) {
-  if (!r) return null
-  rememberSigned(r.publicId, r.photoUrl)
+  if (!r && !cachedPhoto) return null
+  const finalPhotoUrl = url(r?.photoUrl) || url(cachedPhoto)
+  if (r?.publicId || finalPhotoUrl) {
+    rememberSigned(r?.publicId, finalPhotoUrl)
+  }
   return {
-    bookingId: r.bookingId,
-    stage: r.stage,
-    publicId: r.publicId || null,
-    photoUrl: url(r.photoUrl),
-    ocrKwh: r.ocrKwh == null ? null : num(r.ocrKwh),
-    driverValue: r.driverValue == null ? null : num(r.driverValue),
-    hostValue: r.hostValue == null ? null : num(r.hostValue),
-    status: r.status || "pending",
-    uploadedAt: num(r.uploadedAt),
-    uploadedBy: r.uploadedBy || null,
+    bookingId: bId,
+    stage: stg,
+    publicId: r?.publicId || null,
+    photoUrl: finalPhotoUrl,
+    ocrKwh: r?.ocrKwh == null ? null : num(r.ocrKwh),
+    driverValue: r?.driverValue == null ? null : num(r.driverValue),
+    hostValue: r?.hostValue == null ? null : num(r.hostValue),
+    status: r?.status || "pending",
+    uploadedAt: num(r?.uploadedAt),
+    uploadedBy: r?.uploadedBy || null,
   }
 }
 
@@ -455,7 +469,10 @@ export function useMeterReadings(bookingId, enabled = true) {
   const key = uid && bookingId ? `readings:${bookingId}` : null
   const snap = useResource(key, async () => {
     const j = await fetchReadings(bookingId)
-    return { start: rowToReading(j.start), end: rowToReading(j.end) }
+    return {
+      start: rowToReading(j.start, bookingId, "start"),
+      end: rowToReading(j.end, bookingId, "end"),
+    }
   })
   useTopic(key && userTopic(uid), (m) => {
     const id = m.payload?.bookingId ?? m.payload?.id
@@ -463,8 +480,8 @@ export function useMeterReadings(bookingId, enabled = true) {
       refresh(`readings:${bookingId}`)
   })
   return {
-    start: snap.data?.start ?? null,
-    end: snap.data?.end ?? null,
+    start: snap.data?.start ?? rowToReading(null, bookingId, "start"),
+    end: snap.data?.end ?? rowToReading(null, bookingId, "end"),
     loading: Boolean(key) && snap.loading && !snap.data,
     refresh: () => key && refresh(key),
   }
