@@ -11,27 +11,39 @@ export { isLive }
 
 const shared = (globalThis.__plughomeSupabase ??= { client: null, user: null })
 
-const avatarKey = (uid) => {
-  const id = uid || shared.user?.id
-  return id ? `plughome:saved_avatar:${id}` : null
-}
+const avatarKeyById = (uid) => (uid ? `plughome:avatar:id:${uid}` : null)
+const avatarKeyByEmail = (email) =>
+  email ? `plughome:avatar:email:${String(email).trim().toLowerCase()}` : null
 
-export function saveAvatarPersistent(dataUrl, uid) {
+export function saveAvatarPersistent(dataUrl, uid, email) {
   if (typeof window === "undefined") return
-  const key = avatarKey(uid)
-  if (!key) return
+  const kId = avatarKeyById(uid || shared.user?.id)
+  const kEm = avatarKeyByEmail(email || shared.user?.email)
   try {
-    if (dataUrl) localStorage.setItem(key, dataUrl)
-    else if (dataUrl === "") localStorage.removeItem(key)
+    if (dataUrl) {
+      if (kId) localStorage.setItem(kId, dataUrl)
+      if (kEm) localStorage.setItem(kEm, dataUrl)
+    } else if (dataUrl === "") {
+      if (kId) localStorage.removeItem(kId)
+      if (kEm) localStorage.removeItem(kEm)
+    }
   } catch {}
 }
 
-export function getSavedAvatar(uid) {
+export function getSavedAvatar(uid, email) {
   if (typeof window === "undefined") return ""
-  const key = avatarKey(uid)
-  if (!key) return ""
+  const kId = avatarKeyById(uid)
+  const kEm = avatarKeyByEmail(email)
   try {
-    return localStorage.getItem(key) || ""
+    if (kId) {
+      const byId = localStorage.getItem(kId)
+      if (byId) return byId
+    }
+    if (kEm) {
+      const byEm = localStorage.getItem(kEm)
+      if (byEm) return byEm
+    }
+    return ""
   } catch {
     return ""
   }
@@ -46,12 +58,10 @@ if (isLive && !shared.client) {
       storageKey: "plughome-auth",
     },
   })
-  shared.client.auth.onAuthStateChange((event, session) => {
+  shared.client.auth.onAuthStateChange((event) => {
     if (event === "SIGNED_OUT") {
       shared.user = null
       window.dispatchEvent(new CustomEvent("plughome:session-expired"))
-    } else if (session?.user && shared.user && shared.user.id !== session.user.id) {
-      shared.user = { ...shared.user, id: session.user.id, email: session.user.email }
     }
   })
 }
@@ -65,7 +75,9 @@ export async function getToken() {
   const session = data?.session
   if (!session) return null
 
-  if (session.access_token && session.access_token.length > 3500) {
+  // Only strip if someone had an old huge >7.5KB base64 photoUrl in JWT;
+  // never touch avatarThumb (<1.8KB) so cloud photos always stay intact!
+  if (session.access_token && session.access_token.length > 7500) {
     try {
       await supabase.auth.updateUser({ data: { photoUrl: null } })
       const refreshed = await supabase.auth.refreshSession()
@@ -83,7 +95,6 @@ const PENDING_KEY = "plughome:pending_email_verify"
 const profileKey = (userId, role) =>
   `plughome:onboarding:${role || "driver"}:${userId}`
 
-// Strictly returns onboarding for this specific userId — never falls back to another user's "latest"
 export function getSavedOnboarding(userId, role) {
   if (!userId || typeof window === "undefined") return null
   try {
@@ -92,6 +103,13 @@ export function getSavedOnboarding(userId, role) {
   } catch {
     return null
   }
+}
+
+export function saveUserOnboarding(userId, role, data) {
+  if (!userId || typeof window === "undefined" || !data) return
+  try {
+    localStorage.setItem(profileKey(userId, role), JSON.stringify(data))
+  } catch {}
 }
 
 export function savePendingVerification(payload) {
@@ -116,6 +134,7 @@ export function clearPendingVerification() {
 
 async function finalizeSessionUser(session, fallback = {}, isNewSignup = false) {
   const uid = session.user.id
+  const userEmail = session.user.email || fallback.email || ""
   const meta = session?.user?.user_metadata || {}
   const role = fallback.role || meta.role || "driver"
   const name =
@@ -125,83 +144,54 @@ async function finalizeSessionUser(session, fallback = {}, isNewSignup = false) 
   const onboarding =
     (isNewSignup
       ? fallback.onboarding || meta.onboarding
-      : meta.onboarding || getSavedOnboarding(uid, role) || fallback.onboarding) ||
-    {}
+      : meta.driverDetails ||
+        meta.hostDetails ||
+        meta.onboarding ||
+        getSavedOnboarding(uid, role) ||
+        fallback.onboarding) || {}
 
-  // Set shared.user immediately so avatarKey(uid) knows the active user ID
-  shared.user = {
-    id: uid,
-    name,
-    role,
-    phone,
-    email: session.user.email,
-    photoUrl: "",
-    onboarding,
+  // Resolve photo strictly for THIS user (from local high-res cache OR Supabase Cloud avatarThumb)
+  const cloudPhoto = meta.avatarThumb || meta.photoUrl || ""
+  const localPhoto = getSavedAvatar(uid, userEmail)
+  const finalPhoto = isNewSignup ? "" : localPhoto || cloudPhoto || ""
+
+  if (finalPhoto) {
+    saveAvatarPersistent(finalPhoto, uid, userEmail)
   }
 
+  const resolvedDriverDetails =
+    meta.driverDetails ||
+    (role === "driver" ? onboarding : getSavedOnboarding(uid, "driver")) ||
+    null
+  const resolvedHostDetails =
+    meta.hostDetails ||
+    (role === "host" ? onboarding : getSavedOnboarding(uid, "host")) ||
+    null
+
+  if (resolvedDriverDetails) saveUserOnboarding(uid, "driver", resolvedDriverDetails)
+  if (resolvedHostDetails) saveUserOnboarding(uid, "host", resolvedHostDetails)
+
   const token = (await getToken()) || session.access_token
-  let backendProfile = null
-
   try {
-    if (isNewSignup) {
-      const res = await request("/auth/profile", {
-        method: "POST",
-        token,
-        body: {
-          name,
-          role,
-          phone: phone || undefined,
-          email: session.user.email,
-          ...(role === "host"
-            ? { hostDetails: Object.keys(onboarding).length ? onboarding : undefined }
-            : { driverDetails: Object.keys(onboarding).length ? onboarding : undefined }),
-        },
-      })
-      backendProfile = res?.profile || null
-    } else {
-      // On Sign-In: fetch this user's existing backend profile first so we don't overwrite it
-      const getRes = await request("/auth/profile", { method: "GET", token }).catch(() => null)
-      backendProfile = getRes?.profile || null
-      if (!backendProfile) {
-        const postRes = await request("/auth/profile", {
-          method: "POST",
-          token,
-          body: { name, role, email: session.user.email },
-        })
-        backendProfile = postRes?.profile || null
-      }
-    }
-
-    if (backendProfile?.photoUrl) {
-      saveAvatarPersistent(backendProfile.photoUrl, uid)
-    }
-  } catch {}
-
-  const resolvedOnboarding =
-    (role === "host"
-      ? backendProfile?.hostDetails
-      : backendProfile?.driverDetails) ||
-    meta.onboarding ||
-    getSavedOnboarding(uid, role) ||
-    onboarding
-
-  try {
-    localStorage.setItem(
-      profileKey(uid, role),
-      JSON.stringify(resolvedOnboarding),
-    )
+    await request("/auth/profile", {
+      method: "POST",
+      token,
+      body: { name, role },
+    })
   } catch {}
 
   clearPendingVerification()
 
   shared.user = {
     id: uid,
-    name: backendProfile?.name || meta.name || meta.full_name || name,
-    role: backendProfile?.role || role,
-    phone: backendProfile?.phone || phone,
-    email: backendProfile?.email || session.user.email,
-    photoUrl: backendProfile?.photoUrl || getSavedAvatar(uid) || "",
-    onboarding: resolvedOnboarding,
+    name,
+    role,
+    phone,
+    email: userEmail,
+    photoUrl: finalPhoto,
+    driverDetails: resolvedDriverDetails,
+    hostDetails: resolvedHostDetails,
+    onboarding: role === "host" ? resolvedHostDetails : resolvedDriverDetails,
   }
   return shared.user
 }
@@ -223,7 +213,6 @@ export async function startEmailSignUp({
     throw new ApiError("Password must be at least 6 characters.")
   }
 
-  // Ensure any previous session is signed out before creating a new account
   try {
     await supabase.auth.signOut({ scope: "local" })
     shared.user = null
@@ -253,7 +242,11 @@ export async function startEmailSignUp({
         full_name: name,
         role,
         phone,
+        avatarThumb: "",
         onboarding,
+        ...(role === "host"
+          ? { hostDetails: onboarding }
+          : { driverDetails: onboarding }),
       },
     },
   })
@@ -265,7 +258,7 @@ export async function startEmailSignUp({
   if (data?.session) {
     const user = await finalizeSessionUser(
       data.session,
-      { name, role, phone, onboarding },
+      { name, role, phone, email: cleanEmail, onboarding },
       true,
     )
     return { status: "verified", user }
@@ -286,11 +279,10 @@ export async function checkEmailVerificationStatus({
   onboarding,
 }) {
   if (!supabase) throw new ApiError("Live mode is not configured.")
+  const cleanEmail = String(email || "").trim().toLowerCase()
 
   const { data, error } = await supabase.auth.signInWithPassword({
-    email: String(email || "")
-      .trim()
-      .toLowerCase(),
+    email: cleanEmail,
     password,
   })
 
@@ -305,7 +297,7 @@ export async function checkEmailVerificationStatus({
   if (data?.session) {
     const user = await finalizeSessionUser(
       data.session,
-      { name, role, phone, onboarding },
+      { name, role, phone, email: cleanEmail, onboarding },
       true,
     )
     return { verified: true, user }
@@ -350,7 +342,6 @@ export async function signInAs({
     throw new ApiError("Please enter your registered email and password.")
   }
 
-  // Clear any old session before signing into the new account
   try {
     await supabase.auth.signOut({ scope: "local" })
     shared.user = null
@@ -378,6 +369,7 @@ export async function signInAs({
       name: meta.name || meta.full_name || name,
       role: role || meta.role,
       phone: meta.phone || phone,
+      email: cleanEmail,
       onboarding: meta.onboarding || onboarding,
     },
     false,
@@ -415,62 +407,5 @@ export async function signOut() {
   if (!supabase) return
   try {
     await supabase.auth.signOut({ scope: "local" })
-  } catch {}
-}
-
-// ---------------------------------------------------------------------------
-// Profile photo in Supabase Storage (public bucket "avatars").
-// Har user ki apni file:  <user_id>/avatar.jpg
-// ---------------------------------------------------------------------------
-const AVATAR_BUCKET = "avatars"
-const avatarPath = (uid) => `${uid}/avatar.jpg`
-
-async function activeUid() {
-  if (!supabase) return null
-  const { data } = await supabase.auth.getSession()
-  return data?.session?.user?.id || null
-}
-
-export async function uploadAvatarToBucket(userId, blob) {
-  if (!supabase || !userId || !blob) return ""
-  if ((await activeUid()) !== userId) return ""
-  const path = avatarPath(userId)
-  const { error } = await supabase.storage
-    .from(AVATAR_BUCKET)
-    .upload(path, blob, {
-      upsert: true,
-      contentType: "image/jpeg",
-      cacheControl: "60",
-    })
-  if (error) throw error
-  const { data } = supabase.storage.from(AVATAR_BUCKET).getPublicUrl(path)
-  return data?.publicUrl ? `${data.publicUrl}?v=${Date.now()}` : ""
-}
-
-export async function fetchAvatarFromBucket(uid) {
-  if (!supabase || !uid) return ""
-  if ((await activeUid()) !== uid) return ""
-  try {
-    const { data: files, error } = await supabase.storage
-      .from(AVATAR_BUCKET)
-      .list(uid, { limit: 5, search: "avatar" })
-    if (error) return ""
-    const f = (files || []).find((x) => x.name === "avatar.jpg")
-    if (!f) return "" // is user ne photo upload hi nahi ki
-    const { data } = supabase.storage
-      .from(AVATAR_BUCKET)
-      .getPublicUrl(avatarPath(uid))
-    const v = f.updated_at ? new Date(f.updated_at).getTime() : Date.now()
-    return data?.publicUrl ? `${data.publicUrl}?v=${v}` : ""
-  } catch {
-    return ""
-  }
-}
-
-export async function removeAvatarFromBucket(userId) {
-  if (!supabase || !userId) return
-  if ((await activeUid()) !== userId) return
-  try {
-    await supabase.storage.from(AVATAR_BUCKET).remove([avatarPath(userId)])
   } catch {}
 }

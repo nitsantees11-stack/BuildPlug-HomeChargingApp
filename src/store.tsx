@@ -12,26 +12,22 @@ import { getSavedAvatar, saveAvatarPersistent } from "./lib/supabase"
 
 const STORAGE_PREFIX = "plughome:user_prefs:"
 
-// Strictly loads preferences ONLY for the matching userId or email (no global fallback)
 export function loadPersistedUserPrefs(userId, email) {
   if (typeof window === "undefined") return null
   try {
-    const keysToTry = [
-      userId && `${STORAGE_PREFIX}${userId}`,
-      email && `${STORAGE_PREFIX}email:${email.trim().toLowerCase()}`,
-    ].filter(Boolean)
-
-    for (const k of keysToTry) {
-      const raw = localStorage.getItem(k)
+    if (userId) {
+      const raw = localStorage.getItem(`${STORAGE_PREFIX}${userId}`)
       if (raw) {
         const parsed = JSON.parse(raw)
-        if (
-          parsed &&
-          typeof parsed === "object" &&
-          (!userId || !parsed.userId || parsed.userId === userId)
-        ) {
-          return parsed
-        }
+        if (parsed && typeof parsed === "object") return parsed
+      }
+    }
+    if (email) {
+      const cleanEm = String(email).trim().toLowerCase()
+      const rawEm = localStorage.getItem(`${STORAGE_PREFIX}email:${cleanEm}`)
+      if (rawEm) {
+        const parsedEm = JSON.parse(rawEm)
+        if (parsedEm && typeof parsedEm === "object") return parsedEm
       }
     }
     return null
@@ -41,14 +37,18 @@ export function loadPersistedUserPrefs(userId, email) {
 }
 
 export function savePersistedUserPrefs(userId, data) {
-  if (typeof window === "undefined" || !data || !userId) return
+  if (typeof window === "undefined" || !data) return
   try {
-    if (data.photoUrl) saveAvatarPersistent(data.photoUrl, userId)
+    if (data.photoUrl !== undefined) {
+      saveAvatarPersistent(data.photoUrl || "", userId, data.email)
+    }
     const payload = JSON.stringify({ ...data, userId })
-    localStorage.setItem(`${STORAGE_PREFIX}${userId}`, payload)
+    if (userId) {
+      localStorage.setItem(`${STORAGE_PREFIX}${userId}`, payload)
+    }
     if (data.email) {
       localStorage.setItem(
-        `${STORAGE_PREFIX}email:${data.email.trim().toLowerCase()}`,
+        `${STORAGE_PREFIX}email:${String(data.email).trim().toLowerCase()}`,
         payload,
       )
     }
@@ -105,22 +105,28 @@ const upsert = (list, item) =>
 function reducer(s, a) {
   switch (a.type) {
     case "LOGIN": {
-      const saved = loadPersistedUserPrefs(a.userId, a.email)
-      const resolvedName = saved?.name || a.name || "EV User"
-      const resolvedPhone = saved?.phone || a.phone || ""
+      const uid = a.userId
+      const saved = loadPersistedUserPrefs(uid, a.email)
+      const resolvedName = a.name || saved?.name || "EV User"
+      const resolvedPhone = a.phone || saved?.phone || ""
       const resolvedEmail = a.email || saved?.email || ""
       const resolvedPhoto =
-        saved?.photoUrl || getSavedAvatar(a.userId) || ""
+        a.photoUrl ||
+        saved?.photoUrl ||
+        getSavedAvatar(uid, resolvedEmail) ||
+        ""
       const resolvedDriver =
+        a.driverDetails ||
         saved?.driverDetails ||
         (a.role === "driver" ? a.onboarding : null) ||
         null
       const resolvedHost =
+        a.hostDetails ||
         saved?.hostDetails ||
         (a.role === "host" ? a.onboarding : null) ||
         null
 
-      savePersistedUserPrefs(a.userId, {
+      savePersistedUserPrefs(uid, {
         name: resolvedName,
         phone: resolvedPhone,
         email: resolvedEmail,
@@ -138,12 +144,15 @@ function reducer(s, a) {
           name: resolvedName,
           phone: resolvedPhone,
           email: resolvedEmail,
-          userId: a.userId,
+          userId: uid,
           demo: false,
         },
         driverTab: a.tab || "find",
         hostTab: "overview",
-        user: { ...NO_LOC, soc: a.onboarding?.currentSoc || 26 },
+        user: {
+          ...NO_LOC,
+          soc: resolvedDriver?.currentSoc || a.onboarding?.currentSoc || 26,
+        },
         selectedHostId: null,
         route: null,
         demo: null,
@@ -160,7 +169,8 @@ function reducer(s, a) {
     case "DEMO_LOGIN": {
       const who = DEMO_USERS[a.role]
       const saved = loadPersistedUserPrefs(who.id, "demo@plughome.in")
-      const resolvedPhoto = saved?.photoUrl || getSavedAvatar(who.id) || ""
+      const resolvedPhoto =
+        saved?.photoUrl || getSavedAvatar(who.id, "demo@plughome.in") || ""
       return {
         ...s,
         session: {
@@ -198,7 +208,6 @@ function reducer(s, a) {
       const uid = s.session.userId
       if (!uid) return s
       const meta = a.meta || {}
-      // Ignore if backend payload belongs to a different userId
       if (meta.id && meta.id !== uid) return s
 
       const nextName = meta.name || meta.full_name || s.session.name
@@ -206,7 +215,11 @@ function reducer(s, a) {
       const nextEmail =
         a.email || meta.email || s.profile.email || s.session.email
       const nextPhoto =
-        meta.photoUrl || s.profile.photoUrl || getSavedAvatar(uid) || ""
+        meta.photoUrl ||
+        meta.avatarThumb ||
+        s.profile.photoUrl ||
+        getSavedAvatar(uid, nextEmail) ||
+        ""
       const nextDriver = meta.driverDetails
         ? { ...(s.profile.driverDetails || {}), ...meta.driverDetails }
         : s.profile.driverDetails
@@ -271,22 +284,23 @@ function reducer(s, a) {
       }
     case "UPDATE_PROFILE": {
       const uid = s.session.userId
-      if (a.photoUrl === "") saveAvatarPersistent("", uid)
-      else if (a.photoUrl) saveAvatarPersistent(a.photoUrl, uid)
+      const em = a.email !== undefined ? a.email : s.session.email
+      if (a.photoUrl === "") saveAvatarPersistent("", uid, em)
+      else if (a.photoUrl) saveAvatarPersistent(a.photoUrl, uid, em)
 
       const nextSession = {
         ...s.session,
         name: a.name !== undefined ? a.name : s.session.name,
         phone: a.phone !== undefined ? a.phone : s.session.phone,
-        email: a.email !== undefined ? a.email : s.session.email,
+        email: em,
       }
       const nextProfile = {
         ...s.profile,
         photoUrl:
           a.photoUrl !== undefined
             ? a.photoUrl
-            : s.profile.photoUrl || getSavedAvatar(uid),
-        email: a.email !== undefined ? a.email : s.profile.email,
+            : s.profile.photoUrl || getSavedAvatar(uid, em),
+        email: em,
         driverDetails:
           a.driverDetails !== undefined
             ? { ...(s.profile.driverDetails || {}), ...a.driverDetails }
