@@ -11,113 +11,47 @@ import {
 import { getSavedAvatar, saveAvatarPersistent } from "./lib/supabase"
 
 const STORAGE_PREFIX = "plughome:user_prefs:"
-const LAST_USER_KEY = "plughome:last_user_prefs"
-const FALLBACK_AVATAR_KEY = "plughome:avatar_backup"
 
-function safeSetItem(key, value) {
-  try {
-    localStorage.setItem(key, value)
-    return true
-  } catch {
-    return false
-  }
-}
-
-export function loadPersistedUserPrefs(userId, email, name) {
+// Strictly loads preferences ONLY for the matching userId or email (no global fallback)
+export function loadPersistedUserPrefs(userId, email) {
   if (typeof window === "undefined") return null
   try {
     const keysToTry = [
       userId && `${STORAGE_PREFIX}${userId}`,
       email && `${STORAGE_PREFIX}email:${email.trim().toLowerCase()}`,
-      name && `${STORAGE_PREFIX}name:${name.trim().toLowerCase()}`,
-      LAST_USER_KEY,
     ].filter(Boolean)
 
-    let merged = null
     for (const k of keysToTry) {
       const raw = localStorage.getItem(k)
       if (raw) {
         const parsed = JSON.parse(raw)
-        if (parsed && typeof parsed === "object") {
-          if (!merged) {
-            merged = { ...parsed }
-          } else {
-            if (!merged.photoUrl && parsed.photoUrl) merged.photoUrl = parsed.photoUrl
-            if (!merged.driverDetails && parsed.driverDetails)
-              merged.driverDetails = parsed.driverDetails
-            if (!merged.hostDetails && parsed.hostDetails)
-              merged.hostDetails = parsed.hostDetails
-            if (!merged.phone && parsed.phone) merged.phone = parsed.phone
-            if (!merged.email && parsed.email) merged.email = parsed.email
-          }
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          (!userId || !parsed.userId || parsed.userId === userId)
+        ) {
+          return parsed
         }
       }
     }
-
-    // Agar kisi purani plughome key mein photo पड़ी ho toh use bhi recover karo
-    if (merged && !merged.photoUrl) {
-      const backupPhoto =
-        getSavedAvatar() || localStorage.getItem(FALLBACK_AVATAR_KEY) || ""
-      if (backupPhoto) {
-        merged.photoUrl = backupPhoto
-      } else {
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i)
-          if (key && key.startsWith(STORAGE_PREFIX)) {
-            try {
-              const p = JSON.parse(localStorage.getItem(key) || "{}")
-              if (p?.photoUrl) {
-                merged.photoUrl = p.photoUrl
-                break
-              }
-            } catch {}
-          }
-        }
-      }
-    }
-
-    return merged
+    return null
   } catch {
     return null
   }
 }
 
 export function savePersistedUserPrefs(userId, data) {
-  if (typeof window === "undefined" || !data) return
+  if (typeof window === "undefined" || !data || !userId) return
   try {
-    const existing = loadPersistedUserPrefs(userId, data.email, data.name)
-    const finalPhoto =
-      data.photoUrl !== undefined && data.photoUrl !== ""
-        ? data.photoUrl
-        : data.photoUrl === ""
-          ? existing?.photoUrl || getSavedAvatar() || ""
-          : existing?.photoUrl || getSavedAvatar() || ""
-
-    if (finalPhoto) {
-      saveAvatarPersistent(finalPhoto)
-      safeSetItem(FALLBACK_AVATAR_KEY, finalPhoto)
-    }
-
-    const fullData = { ...data, photoUrl: finalPhoto }
-    const payload = JSON.stringify(fullData)
-    // Agar Base64 photo badi hone se 5MB quota full ho, toh lightweight copy save karo
-    const lightPayload = JSON.stringify({ ...fullData, photoUrl: "" })
-
-    const writeKey = (k) => {
-      if (!k) return
-      if (!safeSetItem(k, payload)) {
-        safeSetItem(k, lightPayload)
-      }
-    }
-
-    if (userId) writeKey(`${STORAGE_PREFIX}${userId}`)
+    if (data.photoUrl) saveAvatarPersistent(data.photoUrl, userId)
+    const payload = JSON.stringify({ ...data, userId })
+    localStorage.setItem(`${STORAGE_PREFIX}${userId}`, payload)
     if (data.email) {
-      writeKey(`${STORAGE_PREFIX}email:${data.email.trim().toLowerCase()}`)
+      localStorage.setItem(
+        `${STORAGE_PREFIX}email:${data.email.trim().toLowerCase()}`,
+        payload,
+      )
     }
-    if (data.name) {
-      writeKey(`${STORAGE_PREFIX}name:${data.name.trim().toLowerCase()}`)
-    }
-    writeKey(LAST_USER_KEY)
   } catch {}
 }
 
@@ -141,8 +75,12 @@ const DEFAULT_SETTINGS = {
   autoSaveReceipts: true,
 }
 
-const initialSaved =
-  typeof window !== "undefined" ? loadPersistedUserPrefs(null, null, null) : null
+const EMPTY_PROFILE = {
+  photoUrl: "",
+  email: "",
+  driverDetails: null,
+  hostDetails: null,
+}
 
 const initial = {
   session: SIGNED_OUT,
@@ -154,17 +92,7 @@ const initial = {
   route: null,
   toasts: [],
   demo: null,
-  profile: {
-    photoUrl:
-      getSavedAvatar() ||
-      initialSaved?.photoUrl ||
-      (typeof window !== "undefined"
-        ? localStorage.getItem(FALLBACK_AVATAR_KEY) || ""
-        : ""),
-    email: initialSaved?.email || "",
-    driverDetails: initialSaved?.driverDetails || null,
-    hostDetails: initialSaved?.hostDetails || null,
-  },
+  profile: EMPTY_PROFILE,
   settings: DEFAULT_SETTINGS,
   savedRecords: [],
 }
@@ -177,28 +105,19 @@ const upsert = (list, item) =>
 function reducer(s, a) {
   switch (a.type) {
     case "LOGIN": {
-      const saved = loadPersistedUserPrefs(a.userId, a.email, a.name)
-      const resolvedName = saved?.name || a.name
-      const resolvedPhone = saved?.phone || a.phone
-      const resolvedEmail = saved?.email || a.email || ""
+      const saved = loadPersistedUserPrefs(a.userId, a.email)
+      const resolvedName = saved?.name || a.name || "EV User"
+      const resolvedPhone = saved?.phone || a.phone || ""
+      const resolvedEmail = a.email || saved?.email || ""
       const resolvedPhoto =
-        a.photoUrl ||
-        a.onboarding?.photoUrl ||
-        saved?.photoUrl ||
-        getSavedAvatar() ||
-        s.profile.photoUrl ||
-        (typeof window !== "undefined"
-          ? localStorage.getItem(FALLBACK_AVATAR_KEY) || ""
-          : "")
+        saved?.photoUrl || getSavedAvatar(a.userId) || ""
       const resolvedDriver =
         saved?.driverDetails ||
         (a.role === "driver" ? a.onboarding : null) ||
-        s.profile.driverDetails ||
         null
       const resolvedHost =
         saved?.hostDetails ||
         (a.role === "host" ? a.onboarding : null) ||
-        s.profile.hostDetails ||
         null
 
       savePersistedUserPrefs(a.userId, {
@@ -208,8 +127,8 @@ function reducer(s, a) {
         photoUrl: resolvedPhoto,
         driverDetails: resolvedDriver,
         hostDetails: resolvedHost,
-        settings: saved?.settings || s.settings,
-        savedRecords: saved?.savedRecords || s.savedRecords,
+        settings: saved?.settings || DEFAULT_SETTINGS,
+        savedRecords: saved?.savedRecords || [],
       })
 
       return {
@@ -224,6 +143,9 @@ function reducer(s, a) {
         },
         driverTab: a.tab || "find",
         hostTab: "overview",
+        user: { ...NO_LOC, soc: a.onboarding?.currentSoc || 26 },
+        selectedHostId: null,
+        route: null,
         demo: null,
         profile: {
           photoUrl: resolvedPhoto,
@@ -237,14 +159,8 @@ function reducer(s, a) {
     }
     case "DEMO_LOGIN": {
       const who = DEMO_USERS[a.role]
-      const saved = loadPersistedUserPrefs(who.id, "demo@plughome.in", who.name)
-      const resolvedPhoto =
-        saved?.photoUrl ||
-        getSavedAvatar() ||
-        s.profile.photoUrl ||
-        (typeof window !== "undefined"
-          ? localStorage.getItem(FALLBACK_AVATAR_KEY) || ""
-          : "")
+      const saved = loadPersistedUserPrefs(who.id, "demo@plughome.in")
+      const resolvedPhoto = saved?.photoUrl || getSavedAvatar(who.id) || ""
       return {
         ...s,
         session: {
@@ -279,34 +195,26 @@ function reducer(s, a) {
       }
     }
     case "HYDRATE_BACKEND_PROFILE": {
+      const uid = s.session.userId
+      if (!uid) return s
       const meta = a.meta || {}
-      const nextName = meta.name || s.session.name
+      // Ignore if backend payload belongs to a different userId
+      if (meta.id && meta.id !== uid) return s
+
+      const nextName = meta.name || meta.full_name || s.session.name
       const nextPhone = meta.phone || s.session.phone
       const nextEmail =
         a.email || meta.email || s.profile.email || s.session.email
-      const saved = loadPersistedUserPrefs(
-        s.session.userId,
-        nextEmail,
-        nextName,
-      )
       const nextPhoto =
-        meta.photoUrl ||
-        meta.avatar_url ||
-        meta.avatar ||
-        s.profile.photoUrl ||
-        saved?.photoUrl ||
-        getSavedAvatar() ||
-        (typeof window !== "undefined"
-          ? localStorage.getItem(FALLBACK_AVATAR_KEY) || ""
-          : "")
+        meta.photoUrl || s.profile.photoUrl || getSavedAvatar(uid) || ""
       const nextDriver = meta.driverDetails
         ? { ...(s.profile.driverDetails || {}), ...meta.driverDetails }
-        : s.profile.driverDetails || saved?.driverDetails || null
+        : s.profile.driverDetails
       const nextHost = meta.hostDetails
         ? { ...(s.profile.hostDetails || {}), ...meta.hostDetails }
-        : s.profile.hostDetails || saved?.hostDetails || null
+        : s.profile.hostDetails
 
-      savePersistedUserPrefs(s.session.userId, {
+      savePersistedUserPrefs(uid, {
         name: nextName,
         phone: nextPhone,
         email: nextEmail,
@@ -340,11 +248,14 @@ function reducer(s, a) {
         session: SIGNED_OUT,
         driverTab: "find",
         hostTab: "overview",
-        user: { ...NO_LOC, soc: s.user.soc },
+        user: { ...NO_LOC, soc: 14 },
         hosts: [],
         route: null,
         selectedHostId: null,
         demo: null,
+        profile: EMPTY_PROFILE,
+        settings: DEFAULT_SETTINGS,
+        savedRecords: [],
       }
     case "SET_ROLE":
       if (!s.session.demo)
@@ -359,15 +270,9 @@ function reducer(s, a) {
         },
       }
     case "UPDATE_PROFILE": {
-      if (a.photoUrl === "") {
-        saveAvatarPersistent("")
-        try {
-          localStorage.removeItem(FALLBACK_AVATAR_KEY)
-        } catch {}
-      } else if (a.photoUrl) {
-        saveAvatarPersistent(a.photoUrl)
-        safeSetItem(FALLBACK_AVATAR_KEY, a.photoUrl)
-      }
+      const uid = s.session.userId
+      if (a.photoUrl === "") saveAvatarPersistent("", uid)
+      else if (a.photoUrl) saveAvatarPersistent(a.photoUrl, uid)
 
       const nextSession = {
         ...s.session,
@@ -380,11 +285,7 @@ function reducer(s, a) {
         photoUrl:
           a.photoUrl !== undefined
             ? a.photoUrl
-            : s.profile.photoUrl ||
-              getSavedAvatar() ||
-              (typeof window !== "undefined"
-                ? localStorage.getItem(FALLBACK_AVATAR_KEY) || ""
-                : ""),
+            : s.profile.photoUrl || getSavedAvatar(uid),
         email: a.email !== undefined ? a.email : s.profile.email,
         driverDetails:
           a.driverDetails !== undefined
@@ -397,7 +298,7 @@ function reducer(s, a) {
       }
       const nextUser =
         a.soc !== undefined ? { ...s.user, soc: Number(a.soc) } : s.user
-      savePersistedUserPrefs(s.session.userId, {
+      savePersistedUserPrefs(uid, {
         name: nextSession.name,
         phone: nextSession.phone,
         email: nextSession.email,
@@ -415,8 +316,9 @@ function reducer(s, a) {
       }
     }
     case "UPDATE_SETTINGS": {
+      const uid = s.session.userId
       const nextSettings = { ...s.settings, ...a.patch }
-      savePersistedUserPrefs(s.session.userId, {
+      savePersistedUserPrefs(uid, {
         name: s.session.name,
         phone: s.session.phone,
         email: s.session.email,
