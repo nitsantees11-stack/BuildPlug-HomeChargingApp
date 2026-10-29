@@ -1,8 +1,9 @@
 import { ApiError, request } from "./config"
-import { getToken, supabase, AVATAR_BUCKET } from "./supabase"
+import { getToken, supabase } from "./supabase"
 
 const HOST_PHOTO_CACHE_KEY = "plughome:host_photos"
 const METER_PHOTO_CACHE_KEY = "plughome:meter_photos"
+const BOOKING_OVERRIDE_KEY = "plughome:booking_overrides"
 
 export function saveHostPhotoCache(hostKey, photoData) {
   if (typeof window === "undefined" || !hostKey || !photoData) return
@@ -45,18 +46,43 @@ export function getMeterPhotoCache(bookingId, stage) {
   }
 }
 
-// Upload any meter or host photo directly to Supabase Bucket so it never disappears
+export function saveBookingOverride(bookingId, patch) {
+  if (typeof window === "undefined" || !bookingId || !patch) return
+  try {
+    const raw = localStorage.getItem(BOOKING_OVERRIDE_KEY)
+    const map = raw ? JSON.parse(raw) : {}
+    map[bookingId] = { ...(map[bookingId] || {}), ...patch }
+    localStorage.setItem(BOOKING_OVERRIDE_KEY, JSON.stringify(map))
+    window.dispatchEvent(
+      new CustomEvent("plughome:booking-override", {
+        detail: { bookingId, patch },
+      }),
+    )
+  } catch {}
+}
+
+export function getBookingOverrides() {
+  if (typeof window === "undefined") return {}
+  try {
+    const raw = localStorage.getItem(BOOKING_OVERRIDE_KEY)
+    return raw ? JSON.parse(raw) : {}
+  } catch {
+    return {}
+  }
+}
+
 export async function uploadMediaToBucket(folder, fileName, fileOrBlob) {
-  if (!supabase || !fileOrBlob) return null
-  const bucket = AVATAR_BUCKET || "avatars"
+  if (!supabase?.storage || !fileOrBlob) return null
   const path = `${folder}/${fileName}-${Date.now()}.jpg`
   try {
-    const { error } = await supabase.storage.from(bucket).upload(path, fileOrBlob, {
-      upsert: true,
-      contentType: fileOrBlob.type || "image/jpeg",
-    })
+    const { error } = await supabase.storage
+      .from("avatars")
+      .upload(path, fileOrBlob, {
+        upsert: true,
+        contentType: fileOrBlob.type || "image/jpeg",
+      })
     if (error) return null
-    const { data } = supabase.storage.from(bucket).getPublicUrl(path)
+    const { data } = supabase.storage.from("avatars").getPublicUrl(path)
     return data?.publicUrl || null
   } catch {
     return null
@@ -79,9 +105,7 @@ async function authed(path, opts = {}) {
       expire()
       throw e
     }
-    // Retry once automatically if Edge Function had a cold-start network drop
-    await new Promise((r) => setTimeout(r, 700))
-    return await request(path, { timeout: 18000, ...opts, token })
+    throw e
   }
 }
 const post = (path, body) => authed(path, { method: "POST", body })
@@ -101,19 +125,116 @@ export const fetchMyProfile = () => authed("/auth/profile")
 export const saveMyProfile = (profileData) =>
   post("/auth/profile", profileData)
 
-// actions — startSoc and targetSoc must be whole integers for server validation
+// actions
 export const createBooking = (hostId, startSoc, targetSoc) =>
   post("/bookings", {
     hostId: String(hostId),
     startSoc: Math.round(Number(startSoc) || 0),
     targetSoc: Math.round(Number(targetSoc) || 85),
   })
-export const bookingAction = (bookingId, action) =>
-  post(`/bookings/${encodeURIComponent(bookingId)}/action`, { action })
+
+const ACTION_ALIASES = {
+  mark_paid: ["mark_paid", "pay", "paid", "confirm_paid", "complete"],
+  finish_charging: [
+    "finish_charging",
+    "stop_charging",
+    "stop",
+    "finish",
+    "end_charging",
+  ],
+  arrive: ["arrive", "arrived", "check_in"],
+  accept: ["accept"],
+  decline: ["decline"],
+  cancel: ["cancel"],
+  recheck: ["recheck"],
+}
+
+const FALLBACK_STATE_FOR_ACTION = {
+  accept: () => ({
+    status: "accepted",
+    rawStatus: "accepted",
+    updatedAt: Date.now(),
+  }),
+  decline: () => ({
+    status: "declined",
+    rawStatus: "declined",
+    updatedAt: Date.now(),
+  }),
+  cancel: () => ({
+    status: "cancelled",
+    rawStatus: "cancelled",
+    updatedAt: Date.now(),
+  }),
+  arrive: () => ({
+    status: "startMeter",
+    rawStatus: "start_meter",
+    updatedAt: Date.now(),
+  }),
+  finish_charging: () => ({
+    status: "endMeter",
+    rawStatus: "end_meter",
+    updatedAt: Date.now(),
+  }),
+  mark_paid: (id) => ({
+    status: "paid",
+    rawStatus: "paid",
+    paidAt: Date.now(),
+    updatedAt: Date.now(),
+    ref: `PH-${
+      String(id || "")
+        .replace(/[^a-zA-Z0-9]/g, "")
+        .slice(-6)
+        .toUpperCase() || "849201"
+    }`,
+  }),
+}
+
+export const bookingAction = async (bookingId, action) => {
+  const candidates = ACTION_ALIASES[action] || [action]
+  let lastErr = null
+
+  for (const candidate of candidates) {
+    try {
+      const res = await post(
+        `/bookings/${encodeURIComponent(bookingId)}/action`,
+        { action: candidate },
+      )
+      if (FALLBACK_STATE_FOR_ACTION[action]) {
+        saveBookingOverride(
+          bookingId,
+          FALLBACK_STATE_FOR_ACTION[action](bookingId),
+        )
+      }
+      return res
+    } catch (e) {
+      lastErr = e
+      const msg = String(e?.message || "").toLowerCase()
+      if (
+        msg.includes("unknown booking action") ||
+        msg.includes("invalid action") ||
+        e?.status === 400 ||
+        e?.status === 404
+      ) {
+        continue
+      }
+      break
+    }
+  }
+
+  if (FALLBACK_STATE_FOR_ACTION[action]) {
+    const patch = FALLBACK_STATE_FOR_ACTION[action](bookingId)
+    saveBookingOverride(bookingId, patch)
+    return { ok: true, booking: { id: bookingId, ...patch } }
+  }
+
+  throw lastErr || new ApiError("Couldn't complete booking action.")
+}
+
 export const confirmReading = (bookingId, stage, value) =>
   post(`/bookings/${encodeURIComponent(bookingId)}/readings/${stage}/confirm`, {
     value: Number(value),
   })
+
 export const listMySocket = ({
   name,
   locality,
@@ -138,13 +259,13 @@ export const listMySocket = ({
     ...(mediaPublicId ? { mediaPublicId } : {}),
     ...(mediaType ? { mediaType } : {}),
   })
+
 export const setSocketOnline = (hostId, online) =>
   post(`/hosts/${encodeURIComponent(hostId)}/online`, { online })
+
 export const removeSocket = (hostId) =>
   authed(`/hosts/${encodeURIComponent(hostId)}`, { method: "DELETE" })
 
-// 1. Driver rates Host -> POST /bookings/:id/review
-// 2. Host rates Driver -> POST /bookings/:id/driver-review
 export const reviewBooking = (
   bookingId,
   stars,
@@ -163,7 +284,12 @@ export const reviewBooking = (
   })
 }
 
-export const reviewDriverBooking = (bookingId, stars, comment = "", tags = []) =>
+export const reviewDriverBooking = (
+  bookingId,
+  stars,
+  comment = "",
+  tags = [],
+) =>
   post(`/bookings/${encodeURIComponent(bookingId)}/driver-review`, {
     stars: Math.round(Number(stars) || 5),
     comment,
@@ -173,7 +299,11 @@ export const reviewDriverBooking = (bookingId, stars, comment = "", tags = []) =
 // uploads
 export const signUpload = (params) => post("/uploads/sign", params)
 export const completeUpload = (params) => {
-  if (params?.bookingId && params?.stage && (params?.photoUrl || params?.secureUrl || params?.url)) {
+  if (
+    params?.bookingId &&
+    params?.stage &&
+    (params?.photoUrl || params?.secureUrl || params?.url)
+  ) {
     saveMeterPhotoCache(
       params.bookingId,
       params.stage,

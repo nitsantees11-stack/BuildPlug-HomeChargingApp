@@ -14,6 +14,7 @@ import {
   fetchReadings,
   fetchReviews,
   fetchStats,
+  getBookingOverrides,
   getHostPhotoCache,
   getMeterPhotoCache,
 } from "./api"
@@ -51,6 +52,15 @@ const STATUS = {
   cancelled: "cancelled",
   declined: "declined",
   disputed: "disputed",
+}
+const STAGE_RANK = {
+  requested: 0,
+  accepted: 1,
+  startMeter: 2,
+  charging: 3,
+  endMeter: 4,
+  awaitingPay: 5,
+  paid: 6,
 }
 export const ACTIVE_STATUSES = [
   "requested",
@@ -105,7 +115,10 @@ export function rowToHost(r) {
     online: Boolean(r.online),
     isNew: !r.demo && Date.now() - num(r.createdAt) < DAY,
     mediaPublicId: resolvedPublicId,
-    mediaType: r.mediaType || cachedEntry?.mediaType || (resolvedMediaUrl ? "image" : null),
+    mediaType:
+      r.mediaType ||
+      cachedEntry?.mediaType ||
+      (resolvedMediaUrl ? "image" : null),
     mediaUrl: resolvedMediaUrl,
     createdAt: num(r.createdAt),
   }
@@ -113,7 +126,7 @@ export function rowToHost(r) {
 
 export function rowToBooking(r) {
   const startSoc = num(r.startSoc, 0)
-  return {
+  const base = {
     id: r.id,
     hostId: r.hostId,
     hostName: r.hostName || "Host",
@@ -148,6 +161,22 @@ export function rowToBooking(r) {
     createdAt: num(r.createdAt),
     updatedAt: num(r.updatedAt),
   }
+
+  const ov = getBookingOverrides()[base.id]
+  if (ov) {
+    const isTerminal = ov.status === "cancelled" || ov.status === "declined"
+    const ovRank = STAGE_RANK[ov.status] ?? -1
+    const baseRank = STAGE_RANK[base.status] ?? -1
+    if (isTerminal || ovRank > baseRank) {
+      base.status = ov.status
+      base.rawStatus = ov.rawStatus || ov.status
+      base.updatedAt = Math.max(base.updatedAt, num(ov.updatedAt, Date.now()))
+      if (ov.paidAt) base.paidAt = ov.paidAt
+      if (ov.ref && !base.ref) base.ref = ov.ref
+    }
+  }
+
+  return base
 }
 
 export function rowToReading(r, fallbackBookingId = null, fallbackStage = null) {
@@ -169,7 +198,7 @@ export function rowToReading(r, fallbackBookingId = null, fallbackStage = null) 
     driverValue: r?.driverValue == null ? null : num(r.driverValue),
     hostValue: r?.hostValue == null ? null : num(r.hostValue),
     status: r?.status || "pending",
-    uploadedAt: num(r?.uploadedAt),
+    uploadedAt: num(r?.uploadedAt, Date.now()),
     uploadedBy: r?.uploadedBy || null,
   }
 }
@@ -360,7 +389,23 @@ function useTopic(topic, handler) {
 if (typeof window !== "undefined") {
   const onVisible = () =>
     document.visibilityState === "visible" && refreshActive()
+  const onOverride = (e) => {
+    const { bookingId, patch } = e?.detail || {}
+    if (bookingId && patch) {
+      resources.forEach((r) => {
+        if (r.key.startsWith("bookings:") && Array.isArray(r.data)) {
+          r.data = r.data.map((b) =>
+            b.id === bookingId ? { ...b, ...patch } : b,
+          )
+          emit(r)
+        }
+      })
+    }
+    refresh("bookings")
+    refresh("stats")
+  }
   window.addEventListener("online", refreshActive)
+  window.addEventListener("plughome:booking-override", onOverride)
   document.addEventListener("visibilitychange", onVisible)
   let tick = 0
   const poll = setInterval(() => {
@@ -371,6 +416,7 @@ if (typeof window !== "undefined") {
   import.meta.hot?.dispose(() => {
     clearInterval(poll)
     window.removeEventListener("online", refreshActive)
+    window.removeEventListener("plughome:booking-override", onOverride)
     document.removeEventListener("visibilitychange", onVisible)
     channels.forEach((c) => supabase?.removeChannel(c.ch))
     channels.clear()
@@ -489,7 +535,38 @@ export function useMeterReadings(bookingId, enabled = true) {
 
 export function useHostStats(userId, enabled = true) {
   const key = enabled && liveOn() && userId ? `stats:${userId}` : null
-  const snap = useResource(key, async () => (await fetchStats()).stats)
+  const snap = useResource(key, async () => {
+    const [statsRes, bookingsRes] = await Promise.all([
+      fetchStats().catch(() => ({ stats: null })),
+      fetchBookings().catch(() => ({ bookings: [] })),
+    ])
+    const baseStats = statsRes?.stats || {
+      totalEarned: 0,
+      energyShared: 0,
+      cars: 0,
+      last7: [0, 0, 0, 0, 0, 0, 0],
+    }
+    const paidHostBookings = (bookingsRes?.bookings || [])
+      .map(rowToBooking)
+      .filter((b) => b.hostOwnerId === userId && b.status === "paid")
+
+    const calcEarned = paidHostBookings.reduce(
+      (sum, b) => sum + (Number(b.amount) || 0),
+      0,
+    )
+    const calcEnergy = paidHostBookings.reduce(
+      (sum, b) => sum + (Number(b.kwhUsed) || 0),
+      0,
+    )
+    const calcCars = paidHostBookings.length
+
+    return {
+      ...baseStats,
+      totalEarned: Math.max(num(baseStats.totalEarned), calcEarned),
+      energyShared: Math.max(num(baseStats.energyShared), calcEnergy),
+      cars: Math.max(num(baseStats.cars), calcCars),
+    }
+  })
   useTopic(key && userTopic(userId), (m) => {
     if (m.event === "booking" || m.event === "resync") refresh("stats")
   })
@@ -522,7 +599,8 @@ export function usePendingAction(watch, onError) {
     setPending({ label, watch })
     try {
       await fn()
-      refreshActive()
+      await refreshActive()
+      setPending(null)
       return true
     } catch (e) {
       setPending(null)

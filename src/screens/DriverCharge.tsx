@@ -6,16 +6,14 @@ import {
   Check,
   Download,
   Hourglass,
-  MessageSquare,
+  MapPin,
   Navigation,
   Plug,
   Receipt,
   ShieldCheck,
-  Square,
   Star,
   TreePine,
   UserCheck,
-  MapPin,
   X,
 } from "lucide-react"
 import {
@@ -425,7 +423,6 @@ function ChargingCard({ b, host }) {
   )
 }
 
-
 function PayCard({ b, host, pending, onPaid }) {
   return (
     <Card className="p-6">
@@ -529,7 +526,6 @@ function ReceiptCard({ b, host }) {
   )
 }
 
-// 100% Real-Time Two-Way Rating & Review (Server API + Supabase RLS + Realtime)
 function RateHost({ b, host }) {
   const { state, dispatch } = useStore()
   const toast = useToast()
@@ -540,13 +536,11 @@ function RateHost({ b, host }) {
   const [comment, setComment] = useState("")
   const [busy, setBusy] = useState(false)
 
-  // Live RLS state for both Driver->Host review and Host->Driver review on this booking
   const [rlsReviews, setRlsReviews] = useState({
     driver: null,
     host: null,
   })
 
-  // Subscribe to real-time changes on public.reviews for this booking_id
   useEffect(() => {
     if (state.session.demo || !supabase || !b?.id) return
     let active = true
@@ -630,7 +624,6 @@ function RateHost({ b, host }) {
 
     setBusy(true)
     try {
-      // 1. Insert into Supabase RLS table if configured
       if (supabase && state.session.userId) {
         await supabase.from("reviews").upsert(
           {
@@ -647,7 +640,6 @@ function RateHost({ b, host }) {
           { onConflict: "booking_id,by_role" },
         )
       }
-      // 2. Call Backend Edge Function API & refresh live resources
       await reviewBooking(b.id, stars, text, "driver")
       await Promise.all([
         refresh("bookings"),
@@ -664,7 +656,6 @@ function RateHost({ b, host }) {
 
   return (
     <div className="mt-6 border-t border-line pt-4 space-y-4 print:hidden">
-      {/* 1. Driver's Rating for Host */}
       <div>
         <p className="text-sm font-semibold">
           {doneDriver
@@ -718,7 +709,6 @@ function RateHost({ b, host }) {
         )}
       </div>
 
-      {/* 2. Host's Real-Time Review & Rating for Driver */}
       <div className="rounded-2xl bg-mint p-3.5 border border-line/70">
         <p className="text-xs font-bold uppercase tracking-wider text-parrot-ink flex items-center gap-1.5">
           <UserCheck size={14} /> Host's Review for You (Real-Time)
@@ -946,7 +936,12 @@ export default function DriverCharge() {
           )}
           {b.status === "startMeter" && (
             <Card className="p-6 grid md:grid-cols-2 gap-6 items-center">
-              <LiveMeterTile label="START" reading={start} />
+              <LiveMeterTile
+                label="START"
+                reading={start}
+                bookingId={b.id}
+                stage="start"
+              />
               <div>
                 <h3 className="font-display text-2xl font-extrabold">
                   Capture the start meter
@@ -963,21 +958,7 @@ export default function DriverCharge() {
           {b.status === "disputed" && b.disputeStage !== "end" && (
             <DisputePanel b={b} start={start} end={end} party="driver" />
           )}
-          {b.status === "charging" && (
-            <ChargingCard
-              b={b}
-              host={host}
-              pending={pending}
-              onFinish={() =>
-                act("Stopping…", "finish_charging", () =>
-                  toast(
-                    "Charging stopped",
-                    "Photograph the meter to finish your bill.",
-                  ),
-                )
-              }
-            />
-          )}
+          {b.status === "charging" && <ChargingCard b={b} host={host} />}
           {idx >= 3 && (
             <div className="grid lg:grid-cols-[1.3fr_1fr] gap-5 items-start">
               <Card className="p-5 md:p-6">
@@ -992,8 +973,16 @@ export default function DriverCharge() {
                     label="START"
                     reading={start}
                     kwh={b.startKwh}
+                    bookingId={b.id}
+                    stage="start"
                   />
-                  <LiveMeterTile label="END" reading={end} kwh={b.endKwh} />
+                  <LiveMeterTile
+                    label="END"
+                    reading={end}
+                    kwh={b.endKwh}
+                    bookingId={b.id}
+                    stage="end"
+                  />
                 </div>
                 {b.hasBill ? (
                   <>
