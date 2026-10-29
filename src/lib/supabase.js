@@ -417,3 +417,60 @@ export async function signOut() {
     await supabase.auth.signOut({ scope: "local" })
   } catch {}
 }
+
+// ---------------------------------------------------------------------------
+// Profile photo in Supabase Storage (public bucket "avatars").
+// Har user ki apni file:  <user_id>/avatar.jpg
+// ---------------------------------------------------------------------------
+const AVATAR_BUCKET = "avatars"
+const avatarPath = (uid) => `${uid}/avatar.jpg`
+
+async function activeUid() {
+  if (!supabase) return null
+  const { data } = await supabase.auth.getSession()
+  return data?.session?.user?.id || null
+}
+
+export async function uploadAvatarToBucket(userId, blob) {
+  if (!supabase || !userId || !blob) return ""
+  if ((await activeUid()) !== userId) return ""
+  const path = avatarPath(userId)
+  const { error } = await supabase.storage
+    .from(AVATAR_BUCKET)
+    .upload(path, blob, {
+      upsert: true,
+      contentType: "image/jpeg",
+      cacheControl: "60",
+    })
+  if (error) throw error
+  const { data } = supabase.storage.from(AVATAR_BUCKET).getPublicUrl(path)
+  return data?.publicUrl ? `${data.publicUrl}?v=${Date.now()}` : ""
+}
+
+export async function fetchAvatarFromBucket(uid) {
+  if (!supabase || !uid) return ""
+  if ((await activeUid()) !== uid) return ""
+  try {
+    const { data: files, error } = await supabase.storage
+      .from(AVATAR_BUCKET)
+      .list(uid, { limit: 5, search: "avatar" })
+    if (error) return ""
+    const f = (files || []).find((x) => x.name === "avatar.jpg")
+    if (!f) return "" // is user ne photo upload hi nahi ki
+    const { data } = supabase.storage
+      .from(AVATAR_BUCKET)
+      .getPublicUrl(avatarPath(uid))
+    const v = f.updated_at ? new Date(f.updated_at).getTime() : Date.now()
+    return data?.publicUrl ? `${data.publicUrl}?v=${v}` : ""
+  } catch {
+    return ""
+  }
+}
+
+export async function removeAvatarFromBucket(userId) {
+  if (!supabase || !userId) return
+  if ((await activeUid()) !== userId) return
+  try {
+    await supabase.storage.from(AVATAR_BUCKET).remove([avatarPath(userId)])
+  } catch {}
+}

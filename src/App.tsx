@@ -96,26 +96,20 @@ const ALL_PERKS = [
 ]
 
 // Sync updated onboarding details into localStorage keys used by supabase.js
+// Sync updated onboarding details into THIS user's own localStorage record only
 function syncOnboardingStorage(userId, role, updatedDetails) {
-  if (typeof window === "undefined") return
+  if (typeof window === "undefined" || !userId) return
+  const key = `plughome:onboarding:${role || "driver"}:${userId}`
   try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i)
-      if (
-        k &&
-        (k.includes("onboarding") || (userId && k.includes(String(userId))))
-      ) {
-        try {
-          const parsed = JSON.parse(localStorage.getItem(k))
-          if (parsed && typeof parsed === "object") {
-            localStorage.setItem(
-              k,
-              JSON.stringify({ ...parsed, ...updatedDetails }),
-            )
-          }
-        } catch {}
-      }
-    }
+    const raw = localStorage.getItem(key)
+    const parsed = raw ? JSON.parse(raw) : {}
+    localStorage.setItem(
+      key,
+      JSON.stringify({
+        ...(parsed && typeof parsed === "object" ? parsed : {}),
+        ...updatedDetails,
+      }),
+    )
   } catch {}
 }
 

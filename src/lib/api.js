@@ -1,25 +1,22 @@
 import { ApiError, request } from "./config"
-import { getToken, supabase } from "./supabase"
+import { getLiveUser, getToken, supabase } from "./supabase"
 
-const LEGACY_KEY = "plughome:host_photos" // old shared key (the bug) - removed automatically
-const KEY_PREFIX = "plughome:host_photos:" // new key: one cache per signed-in user
+const LEGACY_KEY = "plughome:host_photos" // purani shared key (bug), apne aap hat jaati hai
+const KEY_PREFIX = "plughome:host_photos:" // nayi key: har user ka alag cache
 
-// who is signed in right now, read from Supabase's own session in localStorage
+// abhi kaun login hai: pehle live user, phir Supabase ka saved session
 function currentUid() {
+  const live = getLiveUser()?.id
+  if (live) return live
   if (typeof window === "undefined") return null
   try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i)
-      if (k && k.startsWith("sb-") && k.endsWith("-auth-token")) {
-        const id = JSON.parse(localStorage.getItem(k) || "null")?.user?.id
-        if (id) return id
-      }
-    }
-  } catch {}
-  return null
+    return JSON.parse(localStorage.getItem("plughome-auth") || "null")?.user?.id || null
+  } catch {
+    return null
+  }
 }
 
-// drop the old shared cache and any other user's cache
+// purana shared cache aur kisi doosre user ka cache hata do
 function purgeForeignPhotoCaches(uid) {
   try {
     const drop = []
@@ -33,7 +30,7 @@ function purgeForeignPhotoCaches(uid) {
   } catch {}
 }
 
-// call this on logout too
+// logout par bhi call kar sakte hain
 export function clearPhotoCaches() {
   try {
     Object.keys(localStorage)
@@ -56,7 +53,7 @@ export function saveHostPhotoCache(hostKey, photoData) {
 
 export function getHostPhotoCache() {
   const uid = currentUid()
-  if (typeof window === "undefined" || !uid) return {} // not signed in = no cache
+  if (typeof window === "undefined" || !uid) return {} // login nahi = koi cache nahi
   purgeForeignPhotoCaches(uid)
   try {
     const raw = localStorage.getItem(KEY_PREFIX + uid)
