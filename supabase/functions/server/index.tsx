@@ -927,14 +927,36 @@ app.post(`${P}/bookings/:id/action`, async (c) => {
   if (!ACTIONS.includes(action)) fail(400, "Unknown booking action.")
   const paid = action === "mark_paid" || action === "pay_demo"
   const id = c.req.param("id")
-  must(
-    await db.rpc("plughome_booking_action", {
-      p_booking_id: id,
-      p_user: me.id,
-      p_action: paid ? "pay_demo" : action,
-      p_ref: paid ? `PH${shortId().slice(0, 8).toUpperCase()}` : null,
-    }),
-  )
+  if (action === "finish_charging") {
+    // The host owns the socket, so the HOST stops the session. The deployed
+    // plughome_booking_action RPC still only lets the driver do this, so the
+    // transition is done here: host-only, and only from `charging` (the
+    // conditional update keeps it atomic if both sides tap at once).
+    const cur = await getBooking(id)
+    if (cur.host_owner_id !== me.id && cur.driver_id !== me.id)
+      fail(404, "That booking no longer exists.")
+    if (cur.host_owner_id !== me.id)
+      fail(403, "Only the host can stop charging.")
+    if (cur.status !== "charging") stale(cur)
+    const moved = must(
+      await db
+        .from("bookings")
+        .update({ status: "end_meter" })
+        .eq("id", id)
+        .eq("status", "charging")
+        .select("id"),
+    )
+    if (!moved?.length) stale(await getBooking(id))
+  } else {
+    must(
+      await db.rpc("plughome_booking_action", {
+        p_booking_id: id,
+        p_user: me.id,
+        p_action: paid ? "pay_demo" : action,
+        p_ref: paid ? `PH${shortId().slice(0, 8).toUpperCase()}` : null,
+      }),
+    )
+  }
   const b = await getBooking(id)
   const events = action === "recheck" ? ["booking", "reading"] : ["booking"]
   await broadcast(bookingMsgs(b, events))
