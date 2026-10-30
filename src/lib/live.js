@@ -14,9 +14,9 @@ import {
   fetchReadings,
   fetchReviews,
   fetchStats,
-  getBookingOverrides,
-  getHostPhotoCache,
-  getMeterPhotoCache,
+  getLocalVerifiedReviewForBooking,
+  getLocalVerifiedReviewsForHost,
+  reconcileBookingRows,
 } from "./api"
 import { clearSigned, rememberSigned, setCloud } from "./cloudinary"
 
@@ -53,15 +53,6 @@ const STATUS = {
   declined: "declined",
   disputed: "disputed",
 }
-const STAGE_RANK = {
-  requested: 0,
-  accepted: 1,
-  startMeter: 2,
-  charging: 3,
-  endMeter: 4,
-  awaitingPay: 5,
-  paid: 6,
-}
 export const ACTIVE_STATUSES = [
   "requested",
   "accepted",
@@ -80,22 +71,18 @@ export const stepStatus = (b) =>
     : b?.status
 
 export function rowToHost(r) {
-  const hostCache = getHostPhotoCache()
-  const cachedEntry =
-    hostCache[r.id] ||
-    hostCache[r.ownerId] ||
-    hostCache[(r.name || "").trim().toLowerCase()] ||
-    null
-  const cachedUrl =
-    typeof cachedEntry === "string"
-      ? cachedEntry
-      : cachedEntry?.mediaUrl || cachedEntry?.url || null
-
-  const resolvedMediaUrl = url(r.mediaUrl) || url(cachedUrl)
-  const resolvedPublicId = r.mediaPublicId || cachedEntry?.mediaPublicId || null
-
-  rememberSigned(resolvedPublicId, resolvedMediaUrl)
-  const reviews = num(r.reviews, 0)
+  rememberSigned(r.mediaPublicId, r.mediaUrl)
+  const localRevs = getLocalVerifiedReviewsForHost(r.id)
+  const baseReviews = num(r.reviews, 0)
+  const reviews = baseReviews + localRevs.length
+  let rating = baseReviews > 0 ? num(r.rating, 5) : null
+  if (localRevs.length > 0) {
+    const localSum = localRevs.reduce((s, x) => s + Number(x.stars || 5), 0)
+    rating =
+      Math.round(
+        (((rating || 5) * baseReviews + localSum) / reviews) * 10,
+      ) / 10
+  }
   return {
     id: r.id,
     name: r.name || "Home socket",
@@ -110,23 +97,27 @@ export function rowToHost(r) {
     kw: num(r.kw, 3.3),
     rate: num(r.rate, 12),
     perks: Array.isArray(r.perks) ? r.perks : [],
-    rating: reviews > 0 ? num(r.rating, null) : null,
+    rating,
     reviews,
     online: Boolean(r.online),
     isNew: !r.demo && Date.now() - num(r.createdAt) < DAY,
-    mediaPublicId: resolvedPublicId,
-    mediaType:
-      r.mediaType ||
-      cachedEntry?.mediaType ||
-      (resolvedMediaUrl ? "image" : null),
-    mediaUrl: resolvedMediaUrl,
+    mediaPublicId: r.mediaPublicId || null,
+    mediaType: r.mediaType || null,
+    mediaUrl: url(r.mediaUrl),
     createdAt: num(r.createdAt),
   }
 }
 
 export function rowToBooking(r) {
   const startSoc = num(r.startSoc, 0)
-  const base = {
+  const localRev = getLocalVerifiedReviewForBooking(r.id)
+  // server status always wins — stale local "paid" flags must not hide an
+  // in-flight booking (it would block new bookings with no way to finish it)
+  const resolvedStatus = STATUS[r.status] || r.status
+  const resolvedRawStatus = r.status
+  const resolvedReview = r.review || localRev || null
+
+  return {
     id: r.id,
     hostId: r.hostId,
     hostName: r.hostName || "Host",
@@ -140,8 +131,8 @@ export function rowToBooking(r) {
       ? r.driverPastReviews
       : [],
     car: r.car || "EV",
-    status: STATUS[r.status] || r.status,
-    rawStatus: r.status,
+    status: resolvedStatus,
+    rawStatus: resolvedRawStatus,
     startSoc,
     targetSoc: num(r.targetSoc, startSoc),
     rate: num(r.rate, 12),
@@ -155,51 +146,28 @@ export function rowToBooking(r) {
     ref: r.ref || null,
     paidAt: r.paidAt || null,
     disputeStage: r.disputeStage || null,
-    review: r.review || null,
-    driverReview: r.review || null,
+    review: resolvedReview,
+    driverReview: resolvedReview,
     hostReview: r.driverReview || null,
     createdAt: num(r.createdAt),
     updatedAt: num(r.updatedAt),
   }
-
-  const ov = getBookingOverrides()[base.id]
-  if (ov) {
-    const isTerminal = ov.status === "cancelled" || ov.status === "declined"
-    const ovRank = STAGE_RANK[ov.status] ?? -1
-    const baseRank = STAGE_RANK[base.status] ?? -1
-    if (isTerminal || ovRank > baseRank) {
-      base.status = ov.status
-      base.rawStatus = ov.rawStatus || ov.status
-      base.updatedAt = Math.max(base.updatedAt, num(ov.updatedAt, Date.now()))
-      if (ov.paidAt) base.paidAt = ov.paidAt
-      if (ov.ref && !base.ref) base.ref = ov.ref
-    }
-  }
-
-  return base
 }
 
-export function rowToReading(r, fallbackBookingId = null, fallbackStage = null) {
-  const bId = r?.bookingId || fallbackBookingId
-  const stg = r?.stage || fallbackStage
-  const cachedPhoto = bId && stg ? getMeterPhotoCache(bId, stg) : null
-
-  if (!r && !cachedPhoto) return null
-  const finalPhotoUrl = url(r?.photoUrl) || url(cachedPhoto)
-  if (r?.publicId || finalPhotoUrl) {
-    rememberSigned(r?.publicId, finalPhotoUrl)
-  }
+export function rowToReading(r) {
+  if (!r) return null
+  rememberSigned(r.publicId, r.photoUrl)
   return {
-    bookingId: bId,
-    stage: stg,
-    publicId: r?.publicId || null,
-    photoUrl: finalPhotoUrl,
-    ocrKwh: r?.ocrKwh == null ? null : num(r.ocrKwh),
-    driverValue: r?.driverValue == null ? null : num(r.driverValue),
-    hostValue: r?.hostValue == null ? null : num(r.hostValue),
-    status: r?.status || "pending",
-    uploadedAt: num(r?.uploadedAt, Date.now()),
-    uploadedBy: r?.uploadedBy || null,
+    bookingId: r.bookingId,
+    stage: r.stage,
+    publicId: r.publicId || null,
+    photoUrl: url(r.photoUrl),
+    ocrKwh: r.ocrKwh == null ? null : num(r.ocrKwh),
+    driverValue: r.driverValue == null ? null : num(r.driverValue),
+    hostValue: r.hostValue == null ? null : num(r.hostValue),
+    status: r.status || "pending",
+    uploadedAt: num(r.uploadedAt),
+    uploadedBy: r.uploadedBy || null,
   }
 }
 
@@ -389,23 +357,7 @@ function useTopic(topic, handler) {
 if (typeof window !== "undefined") {
   const onVisible = () =>
     document.visibilityState === "visible" && refreshActive()
-  const onOverride = (e) => {
-    const { bookingId, patch } = e?.detail || {}
-    if (bookingId && patch) {
-      resources.forEach((r) => {
-        if (r.key.startsWith("bookings:") && Array.isArray(r.data)) {
-          r.data = r.data.map((b) =>
-            b.id === bookingId ? { ...b, ...patch } : b,
-          )
-          emit(r)
-        }
-      })
-    }
-    refresh("bookings")
-    refresh("stats")
-  }
   window.addEventListener("online", refreshActive)
-  window.addEventListener("plughome:booking-override", onOverride)
   document.addEventListener("visibilitychange", onVisible)
   let tick = 0
   const poll = setInterval(() => {
@@ -416,7 +368,6 @@ if (typeof window !== "undefined") {
   import.meta.hot?.dispose(() => {
     clearInterval(poll)
     window.removeEventListener("online", refreshActive)
-    window.removeEventListener("plughome:booking-override", onOverride)
     document.removeEventListener("visibilitychange", onVisible)
     channels.forEach((c) => supabase?.removeChannel(c.ch))
     channels.clear()
@@ -457,25 +408,152 @@ export function useHosts(enabled = true) {
 export function useBookings(enabled = true) {
   const uid = enabled && liveOn() ? getLiveUser()?.id : null
   const key = uid ? `bookings:${uid}` : null
-  const snap = useResource(key, async () =>
-    (await fetchBookings()).bookings.map(rowToBooking),
-  )
+  const snap = useResource(key, async () => {
+    const rows = reconcileBookingRows((await fetchBookings()).bookings || [])
+    writeBookingCache(uid, rows)
+    return rows.map(rowToBooking)
+  })
   useTopic(uid && userTopic(uid), (m) => {
     if (m.event === "booking" || m.event === "resync") refresh("bookings")
   })
+  useDbEvents(uid)
+  // last list this device saw: shown while the first fetch is slow or failing,
+  // so My Charge / History never go blank
+  const cached = snap.data ? null : readBookingCache(uid)
   return {
-    bookings: snap.data || NO_BOOKINGS,
-    loading: Boolean(key) && snap.loading && !snap.data,
+    bookings: snap.data || cached || NO_BOOKINGS,
+    loading: Boolean(key) && snap.loading && !snap.data && !cached,
     error: snap.error,
+    stale: Boolean(cached),
     refresh: () => refresh("bookings"),
   }
+}
+
+const CACHE_PREFIX = "plughome:bookings_cache:"
+const cacheMemo = { uid: null, raw: null, list: null }
+function writeBookingCache(uid, rows) {
+  try {
+    localStorage.setItem(CACHE_PREFIX + uid, JSON.stringify(rows.slice(0, 60)))
+  } catch {}
+}
+function readBookingCache(uid) {
+  if (!uid || typeof window === "undefined") return null
+  try {
+    const raw = localStorage.getItem(CACHE_PREFIX + uid)
+    if (!raw) return null
+    if (cacheMemo.uid === uid && cacheMemo.raw === raw) return cacheMemo.list
+    const list = reconcileBookingRows(JSON.parse(raw)).map(rowToBooking)
+    Object.assign(cacheMemo, { uid, raw, list })
+    return list
+  } catch {
+    return null
+  }
+}
+
+// A successful action returns the updated booking: show it right away (the
+// list fetch / realtime push that follows confirms it).
+export function applyBookingRow(row) {
+  if (!row?.id) return
+  const b = rowToBooking(row)
+  resources.forEach((r) => {
+    if (!r.key.startsWith("bookings:") || !Array.isArray(r.data)) return
+    r.data = r.data.some((x) => x.id === b.id)
+      ? r.data.map((x) => (x.id === b.id ? b : x))
+      : [b, ...r.data]
+    emit(r)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Booking timeline + database realtime (migration 20261030100000).
+// `booking_events` is written by database triggers, so it stays accurate even
+// when the edge function is older than the app. Both features degrade quietly
+// to the server broadcast + derived timeline if the migration isn't applied.
+// ---------------------------------------------------------------------------
+const NO_EVENTS = []
+let eventsMissing = false
+
+export function rowToEvent(r) {
+  return {
+    id: r.id,
+    bookingId: r.booking_id,
+    event: r.event,
+    status: STATUS[r.to_status] || r.to_status || null,
+    stage: r.meta?.stage || null,
+    at: Date.parse(r.created_at) || null,
+  }
+}
+
+export function useBookingEvents(bookingId, enabled = true) {
+  const uid = enabled && liveOn() && supabase ? getLiveUser()?.id : null
+  const key = uid && bookingId ? `events:${bookingId}` : null
+  const snap = useResource(key, async () => {
+    if (eventsMissing) return NO_EVENTS
+    const { data, error } = await supabase
+      .from("booking_events")
+      .select("id, booking_id, event, to_status, meta, created_at")
+      .eq("booking_id", bookingId)
+      .order("created_at", { ascending: true })
+    if (error) {
+      // table not created yet (42P01) or not exposed — stop asking
+      if (error.code === "42P01" || error.code === "PGRST205")
+        eventsMissing = true
+      return NO_EVENTS
+    }
+    return (data || []).map(rowToEvent)
+  })
+  return snap.data || NO_EVENTS
+}
+
+// One postgres_changes channel per signed-in user. RLS on booking_events only
+// delivers rows for bookings the user is driver or host of.
+const dbChannel = { uid: null, ch: null, refs: 0 }
+function useDbEvents(uid) {
+  useEffect(() => {
+    if (!uid || !supabase || judgeMode) return
+    if (dbChannel.uid !== uid) {
+      if (dbChannel.ch) supabase.removeChannel(dbChannel.ch)
+      dbChannel.uid = uid
+      dbChannel.refs = 0
+      dbChannel.ch = supabase
+        .channel(`plughome-db-${uid}`)
+        .on(
+          "postgres_changes",
+          { event: "INSERT", schema: "public", table: "booking_events" },
+          ({ new: row }) => {
+            const id = row?.booking_id
+            refresh("bookings")
+            if (!id) return
+            refresh(`events:${id}`)
+            if (row.event === "reading" || row.event === "status")
+              refresh(`readings:${id}`)
+          },
+        )
+        .subscribe()
+    }
+    dbChannel.refs++
+    return () => {
+      if (--dbChannel.refs > 0 || dbChannel.uid !== uid) return
+      supabase.removeChannel(dbChannel.ch)
+      dbChannel.ch = null
+      dbChannel.uid = null
+    }
+  }, [uid])
 }
 
 export function useHostReviews(hostId, enabled = true) {
   const key = enabled && liveOn() && hostId ? `reviews:host:${hostId}` : null
   const snap = useResource(key, async () => {
-    const res = await fetchReviews(hostId)
-    return (res?.reviews || []).map(rowToReview).filter(Boolean)
+    const res = await fetchReviews(hostId).catch(() => ({ reviews: [] }))
+    const serverRevs = (res?.reviews || []).map(rowToReview).filter(Boolean)
+    const localRevs = getLocalVerifiedReviewsForHost(hostId)
+      .map(rowToReview)
+      .filter(Boolean)
+    const seen = new Set(serverRevs.map((r) => r.bookingId))
+    return [
+      ...localRevs.filter((r) => !seen.has(r.bookingId)),
+      ...serverRevs,
+    ]
   })
   useTopic(key && HOSTS_TOPIC, (m) => {
     if (m.event === "host" || m.event === "resync") {
@@ -494,7 +572,7 @@ export function useDriverReviews(driverId, enabled = true) {
   const key =
     enabled && liveOn() && driverId ? `reviews:driver:${driverId}` : null
   const snap = useResource(key, async () => {
-    const res = await fetchDriverReviews(driverId)
+    const res = await fetchDriverReviews(driverId).catch(() => ({ reviews: [] }))
     return (res?.reviews || []).map(rowToReview).filter(Boolean)
   })
   useTopic(key && userTopic(driverId), (m) => {
@@ -515,10 +593,7 @@ export function useMeterReadings(bookingId, enabled = true) {
   const key = uid && bookingId ? `readings:${bookingId}` : null
   const snap = useResource(key, async () => {
     const j = await fetchReadings(bookingId)
-    return {
-      start: rowToReading(j.start, bookingId, "start"),
-      end: rowToReading(j.end, bookingId, "end"),
-    }
+    return { start: rowToReading(j.start), end: rowToReading(j.end) }
   })
   useTopic(key && userTopic(uid), (m) => {
     const id = m.payload?.bookingId ?? m.payload?.id
@@ -526,8 +601,8 @@ export function useMeterReadings(bookingId, enabled = true) {
       refresh(`readings:${bookingId}`)
   })
   return {
-    start: snap.data?.start ?? rowToReading(null, bookingId, "start"),
-    end: snap.data?.end ?? rowToReading(null, bookingId, "end"),
+    start: snap.data?.start ?? null,
+    end: snap.data?.end ?? null,
     loading: Boolean(key) && snap.loading && !snap.data,
     refresh: () => key && refresh(key),
   }
@@ -535,38 +610,7 @@ export function useMeterReadings(bookingId, enabled = true) {
 
 export function useHostStats(userId, enabled = true) {
   const key = enabled && liveOn() && userId ? `stats:${userId}` : null
-  const snap = useResource(key, async () => {
-    const [statsRes, bookingsRes] = await Promise.all([
-      fetchStats().catch(() => ({ stats: null })),
-      fetchBookings().catch(() => ({ bookings: [] })),
-    ])
-    const baseStats = statsRes?.stats || {
-      totalEarned: 0,
-      energyShared: 0,
-      cars: 0,
-      last7: [0, 0, 0, 0, 0, 0, 0],
-    }
-    const paidHostBookings = (bookingsRes?.bookings || [])
-      .map(rowToBooking)
-      .filter((b) => b.hostOwnerId === userId && b.status === "paid")
-
-    const calcEarned = paidHostBookings.reduce(
-      (sum, b) => sum + (Number(b.amount) || 0),
-      0,
-    )
-    const calcEnergy = paidHostBookings.reduce(
-      (sum, b) => sum + (Number(b.kwhUsed) || 0),
-      0,
-    )
-    const calcCars = paidHostBookings.length
-
-    return {
-      ...baseStats,
-      totalEarned: Math.max(num(baseStats.totalEarned), calcEarned),
-      energyShared: Math.max(num(baseStats.energyShared), calcEnergy),
-      cars: Math.max(num(baseStats.cars), calcCars),
-    }
-  })
+  const snap = useResource(key, async () => (await fetchStats()).stats)
   useTopic(key && userTopic(userId), (m) => {
     if (m.event === "booking" || m.event === "resync") refresh("stats")
   })
@@ -599,8 +643,7 @@ export function usePendingAction(watch, onError) {
     setPending({ label, watch })
     try {
       await fn()
-      await refreshActive()
-      setPending(null)
+      refreshActive()
       return true
     } catch (e) {
       setPending(null)

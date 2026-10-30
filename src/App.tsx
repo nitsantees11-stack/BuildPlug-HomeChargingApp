@@ -13,6 +13,8 @@ import { Btn, ErrorBoundary, Logo, Toasts, Wordmark } from "./ui"
 import Login from "./screens/Login"
 import DriverFind from "./screens/DriverFind"
 import DriverCharge from "./screens/DriverCharge"
+import DriverHistory from "./screens/DriverHistory"
+import { TripSheet } from "./screens/Trip"
 import { HostBookings, HostList, HostOverview } from "./screens/Host"
 import Proof from "./screens/Proof"
 import { LiveNotifier } from "./screens/LiveMeter"
@@ -30,6 +32,7 @@ const TABS = {
   driver: [
     ["find", "Find Chargers", MapIcon],
     ["charge", "My Charge", Zap],
+    ["history", "History", History],
     ["proof", "ProofEngine", Cloud],
   ],
   host: [
@@ -811,6 +814,7 @@ function Portal({ onLogout }) {
   const screens = {
     "driver:find": <DriverFind />,
     "driver:charge": <DriverCharge />,
+    "driver:history": <DriverHistory />,
     "driver:proof": <Proof />,
     "host:overview": <HostOverview />,
     "host:list": <HostList goDriver={goDriver} />,
@@ -827,6 +831,9 @@ function Portal({ onLogout }) {
           <ErrorBoundary>{screens[`${role}:${tab}`]}</ErrorBoundary>
         </motion.main>
       </AnimatePresence>
+      <ErrorBoundary>
+        <TripSheet />
+      </ErrorBoundary>
     </div>
   )
 }

@@ -11,6 +11,12 @@ export const ENV_CLOUD = env.VITE_CLOUDINARY_CLOUD_NAME || ""
 export const isLive = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY)
 export const FN_URL = `${SUPABASE_URL}/functions/v1/make-server-14a63397`
 
+// Bucket constants so any file importing them never crashes
+export const AVATAR_BUCKET = "make-14a63397-avatars"
+export const HOST_MEDIA_BUCKET = "make-14a63397-host-media"
+export const METER_BUCKET = "make-14a63397-meter-photos"
+export { projectId, publicAnonKey }
+
 export class ApiError extends Error {
   constructor(message, status = 0, data = null) {
     super(message)
@@ -20,7 +26,10 @@ export class ApiError extends Error {
   }
 }
 
-async function singleFetch(path, { method, body, token, timeout }) {
+export async function request(
+  path,
+  { method = "GET", body, token, timeout = 20000 } = {},
+) {
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), timeout)
   try {
@@ -44,40 +53,18 @@ async function singleFetch(path, { method, body, token, timeout }) {
         data,
       )
     return data
+  } catch (e) {
+    if (e instanceof ApiError) throw e
+    if (e?.name === "AbortError")
+      throw new ApiError(
+        "The server took too long to respond — please try again.",
+      )
+    throw new ApiError(
+      typeof navigator !== "undefined" && navigator.onLine === false
+        ? "You're offline — check your connection and try again."
+        : "Couldn't reach the PLUG-HOME server.",
+    )
   } finally {
     clearTimeout(t)
-  }
-}
-
-export async function request(
-  path,
-  { method = "GET", body, token, timeout = 25000 } = {},
-) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      return await singleFetch(path, { method, body, token, timeout })
-    } catch (e) {
-      if (e instanceof ApiError) {
-        // Retry once on 502/503/504 gateway cold starts
-        if (attempt === 0 && [502, 503, 504].includes(e.status)) {
-          await new Promise((res) => setTimeout(res, 800))
-          continue
-        }
-        throw e
-      }
-      if (attempt === 0) {
-        await new Promise((res) => setTimeout(res, 800))
-        continue
-      }
-      if (e?.name === "AbortError")
-        throw new ApiError(
-          "The server took too long to respond — please try again.",
-        )
-      throw new ApiError(
-        typeof navigator !== "undefined" && navigator.onLine === false
-          ? "You're offline — check your connection and try again."
-          : "Couldn't reach the PLUG-HOME server.",
-      )
-    }
   }
 }

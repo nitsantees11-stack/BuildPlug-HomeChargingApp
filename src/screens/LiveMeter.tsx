@@ -2,45 +2,41 @@
 import { useEffect, useRef, useState } from "react"
 import { AnimatePresence, motion } from "framer-motion"
 import {
-  Camera,
-  Check,
-  Hourglass,
-  RotateCw,
-  ScanLine,
-  TriangleAlert,
+  Camera, Check, Hourglass, RotateCw, ScanLine, TriangleAlert,
 } from "lucide-react"
 import { useStore, useToast } from "../store"
 import { Btn, Card, Img } from "../ui"
 import { round1 } from "../lib"
 import { demoMeterStart, demoReading } from "../demo"
-import {
-  bookingAction,
-  confirmReading,
-  getMeterPhotoCache,
-  saveMeterPhotoCache,
-  uploadMediaToBucket,
-} from "../lib/api"
+import { bookingAction, confirmReading } from "../lib/api"
 import { uploadToCloudinary } from "../lib/upload"
 import { refresh, useBookings, usePendingAction } from "../lib/live"
 import { meterSrcs } from "../lib/data"
 import { useErrorToast } from "../lib/errorToast"
 
-const fmtTime = (ts) =>
-  ts
-    ? new Date(ts).toLocaleTimeString("en-IN", {
-        hour: "numeric",
-        minute: "2-digit",
-      })
-    : "—"
-const kwhText = (v) =>
-  v == null
-    ? "—"
-    : v.toLocaleString("en-IN", {
-        minimumFractionDigits: 1,
-        maximumFractionDigits: 1,
-      })
+const METER_PHOTO_CACHE_KEY = "plughome:meter_photos"
 
-// Compress meter photo to a compact DataURL backup so it never shows "No meter photo yet"
+function saveLocalMeterPhoto(bookingId, stage, photoUrl) {
+  if (typeof window === "undefined" || !bookingId || !stage || !photoUrl) return
+  try {
+    const raw = localStorage.getItem(METER_PHOTO_CACHE_KEY)
+    const map = raw ? JSON.parse(raw) : {}
+    map[`${bookingId}:${stage}`] = photoUrl
+    localStorage.setItem(METER_PHOTO_CACHE_KEY, JSON.stringify(map))
+  } catch {}
+}
+
+function getLocalMeterPhoto(bookingId, stage) {
+  if (typeof window === "undefined" || !bookingId || !stage) return null
+  try {
+    const raw = localStorage.getItem(METER_PHOTO_CACHE_KEY)
+    const map = raw ? JSON.parse(raw) : {}
+    return map[`${bookingId}:${stage}`] || null
+  } catch {
+    return null
+  }
+}
+
 function fileToCompactDataUrl(file, maxDim = 480) {
   return new Promise((resolve) => {
     try {
@@ -49,8 +45,7 @@ function fileToCompactDataUrl(file, maxDim = 480) {
         const img = new Image()
         img.onload = () => {
           const canvas = document.createElement("canvas")
-          let w = img.width
-          let h = img.height
+          let w = img.width, h = img.height
           if (w > h && w > maxDim) {
             h = Math.round((h * maxDim) / w)
             w = maxDim
@@ -74,44 +69,30 @@ function fileToCompactDataUrl(file, maxDim = 480) {
   })
 }
 
+const fmtTime = (ts) =>
+  ts ? new Date(ts).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" }) : "—"
+const kwhText = (v) =>
+  v == null ? "—" : v.toLocaleString("en-IN", { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+
 export function LiveMeterTile({ label, reading, kwh, bookingId, stage }) {
-  const resolvedStage =
-    stage || reading?.stage || (label === "END" ? "end" : "start")
+  const resolvedStage = stage || reading?.stage || (label === "END" ? "end" : "start")
   const resolvedBookingId = bookingId || reading?.bookingId
-  const cachedPhoto =
-    resolvedBookingId && resolvedStage
-      ? getMeterPhotoCache(resolvedBookingId, resolvedStage)
-      : null
+  const cachedPhoto = resolvedBookingId && resolvedStage ? getLocalMeterPhoto(resolvedBookingId, resolvedStage) : null
 
   const value =
-    kwh ??
-    reading?.driverValue ??
-    reading?.hostValue ??
-    reading?.ocrKwh ??
-    reading?.suggested ??
-    null
+    kwh ?? reading?.driverValue ?? reading?.hostValue ?? reading?.ocrKwh ?? reading?.suggested ?? null
 
   const directUrl = reading?.photoUrl || reading?.localUrl || cachedPhoto || null
   const id = reading?.publicId || directUrl
 
-  const baseSrcs = meterSrcs(
-    reading,
-    value != null ? `${label} ${value.toFixed(1)} kWh` : label,
-  )
-  const srcs = Array.from(
-    new Set([directUrl, ...(baseSrcs || []), cachedPhoto].filter(Boolean)),
-  )
+  const baseSrcs = meterSrcs(reading, value != null ? `${label} ${value.toFixed(1)} kWh` : label)
+  const srcs = Array.from(new Set([directUrl, ...(baseSrcs || []), cachedPhoto].filter(Boolean)))
 
   return (
     <div className="rounded-2xl overflow-hidden border border-line bg-white">
       <div className="relative aspect-[3/2] bg-mint">
         {id && srcs.length ? (
-          <Img
-            key={id}
-            srcs={srcs}
-            alt={`${label} meter`}
-            className="h-full w-full object-cover"
-          />
+          <Img key={id} srcs={srcs} alt={`${label} meter`} className="h-full w-full object-cover" />
         ) : (
           <div className="absolute inset-0 grid place-items-center p-4 text-center">
             <div>
@@ -155,39 +136,26 @@ export function MeterCapture({ b, stage, reading, party }) {
   const fileRef = useRef(null)
   const [progress, setProgress] = useState(null)
   const [thumb, setThumb] = useState(null)
-  const [localPhoto, setLocalPhoto] = useState(() =>
-    getMeterPhotoCache(b?.id, stage),
-  )
+  const [localPhoto, setLocalPhoto] = useState(() => getLocalMeterPhoto(b?.id, stage))
   const [value, setValue] = useState("")
 
   const mine = party === "driver" ? reading?.driverValue : reading?.hostValue
   const theirs = party === "driver" ? reading?.hostValue : reading?.driverValue
   const other = party === "driver" ? "host" : "driver"
-  const photo =
-    reading?.publicId ||
-    reading?.photoUrl ||
-    reading?.localUrl ||
-    localPhoto ||
-    null
+  const photo = reading?.publicId || reading?.photoUrl || reading?.localUrl || localPhoto || null
 
   useEffect(() => {
-    const cached = getMeterPhotoCache(b?.id, stage)
+    const cached = getLocalMeterPhoto(b?.id, stage)
     if (cached && !localPhoto) setLocalPhoto(cached)
   }, [b?.id, stage])
 
   useEffect(() => {
-    setValue(
-      photo
-        ? String(mine ?? reading?.ocrKwh ?? reading?.suggested ?? value ?? "")
-        : "",
-    )
+    setValue(photo ? String(mine ?? reading?.ocrKwh ?? reading?.suggested ?? value ?? "") : "")
   }, [photo, mine, reading?.ocrKwh])
 
   useEffect(() => () => thumb && URL.revokeObjectURL(thumb), [thumb])
   const watch = `${b.rawStatus}|${reading?.publicId}|${reading?.driverValue}|${reading?.hostValue}`
-  const [pending, run] = usePendingAction(watch, (e) =>
-    err("Couldn't confirm the reading", e),
-  )
+  const [pending, run] = usePendingAction(watch, (e) => err("Couldn't confirm the reading", e))
 
   const simulate = () => {
     if (progress != null) return
@@ -195,16 +163,8 @@ export function MeterCapture({ b, stage, reading, party }) {
     setTimeout(() => setProgress(100), 250)
     setTimeout(() => {
       const start = b.startKwh ?? demoMeterStart(b.hostId)
-      const v =
-        stage === "start"
-          ? demoMeterStart(b.hostId)
-          : round1(start + (b.estimateKwh || 0))
-      dispatch({
-        type: "DEMO_READING",
-        bookingId: b.id,
-        stage,
-        reading: demoReading(b.id, stage, v),
-      })
+      const v = stage === "start" ? demoMeterStart(b.hostId) : round1(start + (b.estimateKwh || 0))
+      dispatch({ type: "DEMO_READING", bookingId: b.id, stage, reading: demoReading(b.id, stage, v) })
       setProgress(null)
       toast("Simulated meter photo", "Check the reading, then confirm it.")
     }, 600)
@@ -215,18 +175,11 @@ export function MeterCapture({ b, stage, reading, party }) {
     setThumb(URL.createObjectURL(file))
     setProgress(10)
 
-    // 1. Immediately save compact backup & Supabase Bucket URL so photo never vanishes
     const compactUrl = await fileToCompactDataUrl(file)
     if (compactUrl) {
-      saveMeterPhotoCache(b.id, stage, compactUrl)
+      saveLocalMeterPhoto(b.id, stage, compactUrl)
       setLocalPhoto(compactUrl)
     }
-    uploadMediaToBucket("meters", `${b.id}-${stage}`, file).then((bucketUrl) => {
-      if (bucketUrl) {
-        saveMeterPhotoCache(b.id, stage, bucketUrl)
-        setLocalPhoto(bucketUrl)
-      }
-    })
 
     try {
       await uploadToCloudinary({
@@ -240,12 +193,8 @@ export function MeterCapture({ b, stage, reading, party }) {
       await refresh(`readings:${b.id}`)
       toast("Meter photo uploaded", "Check the reading, then confirm it.")
     } catch (e) {
-      // Even if Cloudinary/OCR server had an issue, allow manual reading confirmation using the saved photo
       if (compactUrl) {
-        toast(
-          "Photo saved — enter meter reading",
-          "Type the kWh shown on the meter and confirm.",
-        )
+        toast("Photo saved — enter meter reading", "Type the kWh shown on the meter and confirm.")
       } else {
         err("Meter photo upload failed", e, () => upload(file))
       }
@@ -260,11 +209,7 @@ export function MeterCapture({ b, stage, reading, party }) {
   const confirm = () => {
     if (!demo) return run("Confirming…", () => confirmReading(b.id, stage, n))
     if (stage === "end" && b.startKwh != null && n < b.startKwh)
-      return toast(
-        "Check the end reading",
-        `It can't be below the start reading (${kwhText(b.startKwh)} kWh).`,
-        { tone: "warn" },
-      )
+      return toast("Check the end reading", `It can't be below the start reading (${kwhText(b.startKwh)} kWh).`, { tone: "warn" })
     dispatch({
       type: "DEMO_ACTION",
       id: b.id,
@@ -273,9 +218,7 @@ export function MeterCapture({ b, stage, reading, party }) {
     })
     toast(
       stage === "start" ? "Start meter verified" : "Bill ready",
-      stage === "start"
-        ? `${kwhText(round1(n))} kWh · charging started`
-        : "Both readings confirmed — the bill is locked in.",
+      stage === "start" ? `${kwhText(round1(n))} kWh · charging started` : "Both readings confirmed — the bill is locked in.",
     )
   }
   const capture = () => (demo ? simulate() : fileRef.current?.click())
@@ -296,54 +239,22 @@ export function MeterCapture({ b, stage, reading, party }) {
       />
       <AnimatePresence mode="wait">
         {progress != null ? (
-          <motion.div
-            key="up"
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0 }}
-            className="mt-5 rounded-2xl bg-mint p-3 flex items-center gap-3"
-            aria-live="polite"
-          >
-            {thumb && (
-              <img
-                src={thumb}
-                alt=""
-                className="h-12 w-16 rounded-lg object-cover shrink-0"
-              />
-            )}
+          <motion.div key="up" initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="mt-5 rounded-2xl bg-mint p-3 flex items-center gap-3">
+            {thumb && <img src={thumb} alt="" className="h-12 w-16 rounded-lg object-cover shrink-0" />}
             <div className="flex-1 min-w-0">
               <p className="text-sm font-semibold">
-                {demo ? "Simulating meter photo…" : "Uploading meter photo…"}{" "}
-                <span className="font-mono">{progress}%</span>
+                {demo ? "Simulating meter photo…" : "Uploading meter photo…"} <span className="font-mono">{progress}%</span>
               </p>
-              <div className="mt-1.5 h-2 rounded-full bg-white overflow-hidden">
-                <motion.div
-                  className="h-full btn-primary rounded-full"
-                  animate={{ width: `${progress}%` }}
-                  transition={{ duration: 0.3 }}
-                />
-              </div>
             </div>
           </motion.div>
         ) : !photo ? (
-          <motion.div
-            key="cap"
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0 }}
-          >
+          <motion.div key="cap" initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
             <Btn className="mt-5" icon={Camera} onClick={capture}>
               Capture {stage} meter{demo ? " (simulated)" : ""}
             </Btn>
           </motion.div>
         ) : (
-          <motion.div
-            key="confirm"
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0 }}
-            className="mt-5"
-          >
+          <motion.div key="confirm" initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="mt-5">
             {mine == null ? (
               <>
                 <label className="block text-sm font-medium">
@@ -356,63 +267,31 @@ export function MeterCapture({ b, stage, reading, party }) {
                     value={value}
                     onChange={(e) => setValue(e.target.value)}
                     placeholder="e.g. 1420.0"
-                    className="mt-1.5 w-full h-12 rounded-xl bg-mint px-4 font-mono text-lg font-bold border border-transparent outline-none focus:border-parrot focus:ring-4 focus:ring-parrot/20"
+                    className="mt-1.5 w-full h-12 rounded-xl bg-mint px-4 font-mono text-lg font-bold border border-transparent outline-none focus:border-parrot"
                   />
                 </label>
-                <p className="mt-1.5 text-xs text-mute">
-                  {reading?.simulated
-                    ? "Pre-filled from the simulated meter — edit it to try a different reading."
-                    : reading?.ocrKwh != null
-                      ? "Pre-filled from OCR — fix it if the photo says otherwise."
-                      : "OCR could not read this photo — type the number shown on the meter."}
-                </p>
                 <div className="mt-4 flex flex-wrap gap-2">
-                  <Btn
-                    icon={Check}
-                    disabled={!valid || !!pending}
-                    onClick={confirm}
-                  >
+                  <Btn icon={Check} disabled={!valid || !!pending} onClick={confirm}>
                     {pending || "Confirm reading"}
                   </Btn>
-                  <Btn
-                    variant="secondary"
-                    icon={Camera}
-                    disabled={!!pending}
-                    onClick={capture}
-                  >
+                  <Btn variant="secondary" icon={Camera} disabled={!!pending} onClick={capture}>
                     Retake photo
                   </Btn>
                 </div>
               </>
             ) : theirs == null ? (
-              <div
-                className="rounded-2xl bg-mint p-4 flex gap-3 items-start"
-                aria-live="polite"
-              >
-                <motion.span
-                  animate={{ rotate: [0, 180, 180, 360] }}
-                  transition={{ duration: 2.4, repeat: Infinity }}
-                  className="mt-0.5 text-parrot-ink"
-                >
-                  <Hourglass size={18} />
-                </motion.span>
+              <div className="rounded-2xl bg-mint p-4 flex gap-3 items-start">
+                <Hourglass size={18} className="mt-0.5 text-parrot-ink" />
                 <div>
-                  <p className="font-semibold">
-                    Waiting for the {other} to confirm
-                  </p>
+                  <p className="font-semibold">Waiting for the {other} to confirm</p>
                   <p className="text-sm text-slate">
-                    You confirmed{" "}
-                    <span className="font-mono font-bold text-ink">
-                      {kwhText(mine)} kWh
-                    </span>
-                    . This updates the moment they do.
+                    You confirmed <span className="font-mono font-bold text-ink">{kwhText(mine)} kWh</span>.
                   </p>
                 </div>
               </div>
             ) : (
               <p className="rounded-2xl bg-mint p-4 font-semibold flex items-center gap-2">
-                <Check size={18} className="text-parrot-ink" />
-                Both confirmed {kwhText(mine)} kWh — finalising…
+                <Check size={18} className="text-parrot-ink" /> Both confirmed {kwhText(mine)} kWh — finalising…
               </p>
             )}
           </motion.div>
@@ -424,40 +303,19 @@ export function MeterCapture({ b, stage, reading, party }) {
 
 export function DisputePanel({ b, start, end, party, photos = true }) {
   const err = useErrorToast()
-  const [pending, run] = usePendingAction(b.rawStatus, (e) =>
-    err("Couldn't reopen the reading", e),
-  )
+  const [pending, run] = usePendingAction(b.rawStatus, (e) => err("Couldn't reopen the reading", e))
   const r = b.disputeStage === "end" ? end : start
   return (
     <Card className="p-6">
       <div className="flex items-center gap-2 text-[#B45309]">
         <TriangleAlert size={18} />
-        <span className="text-xs font-bold uppercase tracking-wider">
-          Readings don't match
-        </span>
+        <span className="text-xs font-bold uppercase tracking-wider">Readings don't match</span>
       </div>
-      <h3 className="mt-2 font-display text-xl font-extrabold">
-        The {b.disputeStage || "meter"} readings differ
-      </h3>
-      <p className="text-slate mt-1">
-        Compare both meter photos, agree on the number, then re-check. Nothing
-        is billed until both of you confirm the same reading.
-      </p>
+      <h3 className="mt-2 font-display text-xl font-extrabold">The {b.disputeStage || "meter"} readings differ</h3>
       {photos && (
         <div className="mt-4 grid grid-cols-2 gap-3">
-          <LiveMeterTile
-            label="START"
-            reading={start}
-            kwh={b.startKwh}
-            bookingId={b.id}
-            stage="start"
-          />
-          <LiveMeterTile
-            label="END"
-            reading={end}
-            bookingId={b.id}
-            stage="end"
-          />
+          <LiveMeterTile label="START" reading={start} kwh={b.startKwh} bookingId={b.id} stage="start" />
+          <LiveMeterTile label="END" reading={end} bookingId={b.id} stage="end" />
         </div>
       )}
       <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
@@ -465,25 +323,13 @@ export function DisputePanel({ b, start, end, party, photos = true }) {
           ["Driver entered", r?.driverValue],
           ["Host entered", r?.hostValue],
         ].map(([k, v]) => (
-          <div
-            key={k}
-            className={`rounded-2xl p-3 ${
-              (party === "driver") === (k === "Driver entered")
-                ? "bg-mint"
-                : "border border-line"
-            }`}
-          >
+          <div key={k} className={`rounded-2xl p-3 ${(party === "driver") === (k === "Driver entered") ? "bg-mint" : "border border-line"}`}>
             <p className="text-xs text-slate">{k}</p>
             <p className="font-mono text-lg font-bold">{kwhText(v)} kWh</p>
           </div>
         ))}
       </div>
-      <Btn
-        className="mt-4"
-        icon={RotateCw}
-        disabled={!!pending}
-        onClick={() => run("Reopening…", () => bookingAction(b.id, "recheck"))}
-      >
+      <Btn className="mt-4" icon={RotateCw} disabled={!!pending} onClick={() => run("Reopening…", () => bookingAction(b.id, "recheck"))}>
         {pending || "Re-check reading"}
       </Btn>
     </Card>
@@ -492,47 +338,19 @@ export function DisputePanel({ b, start, end, party, photos = true }) {
 
 const DRIVER_MSG = {
   accepted: (b) => ["Booking accepted", `${b.hostName} is ready — head over.`],
-  declined: (b) => [
-    "Booking declined",
-    `${b.hostName} can't host right now — pick another charger.`,
-    { tone: "warn" },
-  ],
-  charging: (b) => [
-    "Start meter verified",
-    `${kwhText(b.startKwh)} kWh · charging started`,
-  ],
-  endMeter: () => [
-    "Host stopped charging",
-    "Capture or confirm the end meter reading.",
-  ],
-  awaitingPay: (b) => [
-    "Bill ready",
-    `${kwhText(b.kwhUsed)} kWh · ₹${b.amount}`,
-  ],
-  disputed: () => [
-    "Meter readings differ",
-    "Compare both photos and re-check.",
-    { tone: "warn" },
-  ],
+  declined: (b) => ["Booking declined", `${b.hostName} can't host right now — pick another charger.`, { tone: "warn" }],
+  charging: (b) => ["Start meter verified", `${kwhText(b.startKwh)} kWh · charging started`],
+  endMeter: () => ["Host stopped charging", "Capture or confirm the end meter reading."],
+  awaitingPay: (b) => ["Bill ready", `${kwhText(b.kwhUsed)} kWh · ₹${b.amount}`],
+  disputed: () => ["Meter readings differ", "Compare both photos and re-check.", { tone: "warn" }],
 }
 const HOST_MSG = {
-  requested: (b) => [
-    "New booking request",
-    `${b.driver} wants ${b.startSoc}→${b.targetSoc}%`,
-  ],
-  cancelled: (b) => [
-    "Booking cancelled",
-    `${b.driver} cancelled the request.`,
-    { tone: "warn" },
-  ],
+  requested: (b) => ["New booking request", `${b.driver} wants ${b.startSoc}→${b.targetSoc}%`],
+  cancelled: (b) => ["Booking cancelled", `${b.driver} cancelled the request.`, { tone: "warn" }],
   startMeter: () => ["Driver arrived", "Confirm the start meter reading."],
   endMeter: () => ["Charging finished", "Confirm the end meter reading."],
   paid: (b) => ["Payment received", `₹${b.amount} from ${b.driver}`],
-  disputed: () => [
-    "Meter readings differ",
-    "Compare both photos and re-check.",
-    { tone: "warn" },
-  ],
+  disputed: () => ["Meter readings differ", "Compare both photos and re-check.", { tone: "warn" }],
 }
 
 export function LiveNotifier() {

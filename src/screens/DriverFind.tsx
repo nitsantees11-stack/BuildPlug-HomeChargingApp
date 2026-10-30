@@ -761,6 +761,18 @@ export function BookingSheet({ host, onClose }) {
       dispatch({ type: "TAB", role: "driver", tab: "charge" })
     } catch (e) {
       setBusy(false)
+      // The server still has an unfinished session for this driver: show it
+      // on the Charge tab so it can be paid, finished or cancelled.
+      if (e?.status === 409 && /active booking/i.test(String(e?.message || ""))) {
+        await refresh("bookings").catch(() => {})
+        toast(
+          "You have an active booking",
+          "Finish or cancel it on the Charge tab before booking again.",
+        )
+        onClose()
+        dispatch({ type: "TAB", role: "driver", tab: "charge" })
+        return
+      }
       err("Couldn't book this charger", e)
     }
   }

@@ -7,6 +7,8 @@ import { DEMO_STATS, demoBillUrl } from "../demo"
 import { bookingAction } from "./api"
 import { billUrl, meterPhotoUrl, photoUrl } from "./cloudinary"
 import {
+  applyBookingRow,
+  useBookingEvents,
   useBookings,
   useHostStats,
   useHosts,
@@ -70,6 +72,14 @@ export function useStats() {
   return live
 }
 
+// booking timeline rows from the database (live only); Judge Mode and older
+// databases return [] and the screens derive the timeline from the booking.
+export function useTimeline(bookingId) {
+  const demo = useIsDemo()
+  const live = useBookingEvents(bookingId, !demo)
+  return demo ? NONE : live
+}
+
 // Booking transitions. Live: server action + pending label until the status
 // changes. Judge Mode: the local state machine, applied instantly.
 export function useBookingAction(b, onError) {
@@ -86,7 +96,10 @@ export function useBookingAction(b, onError) {
       done?.()
       return Promise.resolve(true)
     }
-    return run(label, () => bookingAction(b.id, action)).then((ok) => {
+    return run(label, async () => {
+      const res = await bookingAction(b.id, action)
+      applyBookingRow(res?.booking)
+    }).then((ok) => {
       if (ok) done?.()
       return ok
     })

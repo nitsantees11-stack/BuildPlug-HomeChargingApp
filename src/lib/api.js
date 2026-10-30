@@ -1,9 +1,11 @@
 import { ApiError, request } from "./config"
 import { getToken, supabase } from "./supabase"
 
+export const AVATAR_BUCKET = "avatars"
 const HOST_PHOTO_CACHE_KEY = "plughome:host_photos"
 const METER_PHOTO_CACHE_KEY = "plughome:meter_photos"
 const BOOKING_OVERRIDE_KEY = "plughome:booking_overrides"
+const LOCAL_REVIEW_KEY = "plughome:verified_reviews"
 
 export function saveHostPhotoCache(hostKey, photoData) {
   if (typeof window === "undefined" || !hostKey || !photoData) return
@@ -71,18 +73,89 @@ export function getBookingOverrides() {
   }
 }
 
+// Confirmed overrides (`plughome:booking_overrides`): the booking row the
+// server returned for a successful action. It bridges the gap until the next
+// list fetch / realtime push shows the same state, then it is dropped. It is
+// never written for a failed action, so it cannot invent a status.
+const OVERRIDE_TTL = 2 * 60 * 1000
+export function saveConfirmedBooking(row) {
+  if (typeof window === "undefined" || !row?.id) return
+  try {
+    const map = getBookingOverrides()
+    map[row.id] = { row, savedAt: Date.now() }
+    localStorage.setItem(BOOKING_OVERRIDE_KEY, JSON.stringify(map))
+  } catch {}
+}
+// returns the fresher of the server row and this device's confirmed row
+export function reconcileBookingRows(rows) {
+  const map = getBookingOverrides()
+  let dirty = false
+  const now = Date.now()
+  const ts = (r) => Number(r?.updatedAt) || 0
+  const out = rows.map((r) => {
+    const o = map[r.id]
+    if (!o) return r
+    const keep = o.row && now - (o.savedAt || 0) < OVERRIDE_TTL && ts(o.row) > ts(r)
+    if (keep) return { ...r, ...o.row }
+    delete map[r.id] // server caught up, expired, or a legacy unconfirmed patch
+    dirty = true
+    return r
+  })
+  if (dirty) {
+    try {
+      localStorage.setItem(BOOKING_OVERRIDE_KEY, JSON.stringify(map))
+    } catch {}
+  }
+  return out
+}
+
+// a booking this device saw marked paid ({ ref, paidAt }), or null
+export function getPaidLocalOverride(bookingId) {
+  const o = bookingId ? getBookingOverrides()[bookingId] : null
+  return o && (o.status === "paid" || o.rawStatus === "paid") ? o : null
+}
+
+// Driver ratings kept on this device when the deployed server has no review
+// route yet; live.js merges them with the server's reviews (by bookingId).
+function readLocalReviews() {
+  if (typeof window === "undefined") return {}
+  try {
+    const map = JSON.parse(localStorage.getItem(LOCAL_REVIEW_KEY) || "{}")
+    return map && typeof map === "object" ? map : {}
+  } catch {
+    return {}
+  }
+}
+function saveLocalReview(review) {
+  if (typeof window === "undefined" || !review?.bookingId) return
+  try {
+    const map = readLocalReviews()
+    map[review.bookingId] = review
+    localStorage.setItem(LOCAL_REVIEW_KEY, JSON.stringify(map))
+  } catch {}
+}
+export function getLocalVerifiedReviewForBooking(bookingId) {
+  return (bookingId && readLocalReviews()[bookingId]) || null
+}
+export function getLocalVerifiedReviewsForHost(hostId) {
+  if (!hostId) return []
+  return Object.values(readLocalReviews()).filter(
+    (r) => r && r.hostId === hostId,
+  )
+}
+
 export async function uploadMediaToBucket(folder, fileName, fileOrBlob) {
   if (!supabase?.storage || !fileOrBlob) return null
   const path = `${folder}/${fileName}-${Date.now()}.jpg`
   try {
     const { error } = await supabase.storage
-      .from("avatars")
+      .from(AVATAR_BUCKET)
       .upload(path, fileOrBlob, {
         upsert: true,
         contentType: fileOrBlob.type || "image/jpeg",
       })
     if (error) return null
-    const { data } = supabase.storage.from("avatars").getPublicUrl(path)
+    const { data } = supabase.storage.from(AVATAR_BUCKET).getPublicUrl(path)
     return data?.publicUrl || null
   } catch {
     return null
@@ -101,18 +174,14 @@ async function authed(path, opts = {}) {
   try {
     return await request(path, { timeout: 15000, ...opts, token })
   } catch (e) {
-    if (e?.status === 401) {
-      expire()
-      throw e
-    }
+    if (e?.status === 401) expire()
     throw e
   }
 }
 const post = (path, body) => authed(path, { method: "POST", body })
 
-// reads
-export const fetchConfig = () => request("/config", { timeout: 8000 })
-export const fetchHosts = () => request("/hosts", { timeout: 12000 })
+export const fetchConfig = () => request("/config", { timeout: 6000 })
+export const fetchHosts = () => request("/hosts")
 export const fetchBookings = () => authed("/bookings")
 export const fetchReadings = (bookingId) =>
   authed(`/bookings/${encodeURIComponent(bookingId)}/readings`)
@@ -125,7 +194,6 @@ export const fetchMyProfile = () => authed("/auth/profile")
 export const saveMyProfile = (profileData) =>
   post("/auth/profile", profileData)
 
-// actions
 export const createBooking = (hostId, startSoc, targetSoc) =>
   post("/bookings", {
     hostId: String(hostId),
@@ -134,7 +202,8 @@ export const createBooking = (hostId, startSoc, targetSoc) =>
   })
 
 const ACTION_ALIASES = {
-  mark_paid: ["mark_paid", "pay", "paid", "confirm_paid", "complete"],
+  // Older deployed servers only know the payment action as "pay_demo".
+  mark_paid: ["mark_paid", "pay_demo"],
   finish_charging: [
     "finish_charging",
     "stop_charging",
@@ -149,82 +218,27 @@ const ACTION_ALIASES = {
   recheck: ["recheck"],
 }
 
-const FALLBACK_STATE_FOR_ACTION = {
-  accept: () => ({
-    status: "accepted",
-    rawStatus: "accepted",
-    updatedAt: Date.now(),
-  }),
-  decline: () => ({
-    status: "declined",
-    rawStatus: "declined",
-    updatedAt: Date.now(),
-  }),
-  cancel: () => ({
-    status: "cancelled",
-    rawStatus: "cancelled",
-    updatedAt: Date.now(),
-  }),
-  arrive: () => ({
-    status: "startMeter",
-    rawStatus: "start_meter",
-    updatedAt: Date.now(),
-  }),
-  finish_charging: () => ({
-    status: "endMeter",
-    rawStatus: "end_meter",
-    updatedAt: Date.now(),
-  }),
-  mark_paid: (id) => ({
-    status: "paid",
-    rawStatus: "paid",
-    paidAt: Date.now(),
-    updatedAt: Date.now(),
-    ref: `PH-${
-      String(id || "")
-        .replace(/[^a-zA-Z0-9]/g, "")
-        .slice(-6)
-        .toUpperCase() || "849201"
-    }`,
-  }),
-}
-
+// The server is the source of truth for booking state. Never record a
+// transition locally when the server rejected it — that left bookings looking
+// finished on this device while the server still counted them as active.
 export const bookingAction = async (bookingId, action) => {
   const candidates = ACTION_ALIASES[action] || [action]
   let lastErr = null
 
   for (const candidate of candidates) {
     try {
-      const res = await post(
-        `/bookings/${encodeURIComponent(bookingId)}/action`,
-        { action: candidate },
-      )
-      if (FALLBACK_STATE_FOR_ACTION[action]) {
-        saveBookingOverride(
-          bookingId,
-          FALLBACK_STATE_FOR_ACTION[action](bookingId),
-        )
-      }
+      const res = await post(`/bookings/${encodeURIComponent(bookingId)}/action`, {
+        action: candidate,
+      })
+      if (res?.booking) saveConfirmedBooking(res.booking)
       return res
     } catch (e) {
       lastErr = e
       const msg = String(e?.message || "").toLowerCase()
-      if (
-        msg.includes("unknown booking action") ||
-        msg.includes("invalid action") ||
-        e?.status === 400 ||
-        e?.status === 404
-      ) {
-        continue
-      }
+      // only retry an alias when the server didn't recognise the action name
+      if (msg.includes("unknown booking action") || msg.includes("invalid action")) continue
       break
     }
-  }
-
-  if (FALLBACK_STATE_FOR_ACTION[action]) {
-    const patch = FALLBACK_STATE_FOR_ACTION[action](bookingId)
-    saveBookingOverride(bookingId, patch)
-    return { ok: true, booking: { id: bookingId, ...patch } }
   }
 
   throw lastErr || new ApiError("Couldn't complete booking action.")
@@ -272,15 +286,34 @@ export const reviewBooking = (
   comment = "",
   byRole = "driver",
   tags = [],
+  extra = {},
 ) => {
   const endpoint =
     byRole === "host"
       ? `/bookings/${encodeURIComponent(bookingId)}/driver-review`
       : `/bookings/${encodeURIComponent(bookingId)}/review`
-  return post(endpoint, {
+  const body = {
     stars: Math.round(Number(stars) || 5),
     comment,
     tags,
+    ...(extra && typeof extra === "object" ? extra : {}),
+  }
+  return post(endpoint, body).catch((e) => {
+    // an older deployed server has no review route (404): keep the driver's
+    // rating on this device instead of losing it; real errors still surface
+    if (byRole === "host" || e?.status !== 404) throw e
+    const review = {
+      bookingId,
+      hostId: body.hostId || null,
+      driverName: body.driverName || "EV Driver",
+      stars: body.stars,
+      comment: String(comment || ""),
+      tags: Array.isArray(tags) ? tags : [],
+      at: Date.now(),
+      local: true,
+    }
+    saveLocalReview(review)
+    return { review, local: true }
   })
 }
 
@@ -289,14 +322,15 @@ export const reviewDriverBooking = (
   stars,
   comment = "",
   tags = [],
+  extra = {},
 ) =>
   post(`/bookings/${encodeURIComponent(bookingId)}/driver-review`, {
     stars: Math.round(Number(stars) || 5),
     comment,
     tags,
+    ...(extra && typeof extra === "object" ? extra : {}),
   })
 
-// uploads
 export const signUpload = (params) => post("/uploads/sign", params)
 export const completeUpload = (params) => {
   if (
