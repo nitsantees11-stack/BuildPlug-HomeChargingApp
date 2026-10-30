@@ -27,7 +27,9 @@ export function loadPersistedUserPrefs(userId, email) {
       const rawEm = localStorage.getItem(`${STORAGE_PREFIX}email:${cleanEm}`)
       if (rawEm) {
         const parsedEm = JSON.parse(rawEm)
-        if (parsedEm && typeof parsedEm === "object") return parsedEm
+        // never hand one account's saved details/photo to a different account
+        const sameUser = !userId || !parsedEm?.userId || parsedEm.userId === userId
+        if (parsedEm && typeof parsedEm === "object" && sameUser) return parsedEm
       }
     }
     return null

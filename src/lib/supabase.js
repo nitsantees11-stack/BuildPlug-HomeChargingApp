@@ -10,23 +10,38 @@ import {
 export { isLive }
 
 export const AVATAR_BUCKET = "avatars"
-const AVATAR_KEY = "plughome:saved_avatar"
+// Profile photos are cached per account. The old single shared key
+// ("plughome:saved_avatar") leaked one account's photo into the next account
+// on the same device, so it is removed and never read again.
+const LEGACY_AVATAR_KEY = "plughome:saved_avatar"
+const avatarKey = (userId) => `${LEGACY_AVATAR_KEY}:${String(userId).trim()}`
 const HOST_PHOTO_CACHE_KEY = "plughome:host_photos"
 const METER_PHOTO_CACHE_KEY = "plughome:meter_photos"
 const BOOKING_OVERRIDE_KEY = "plughome:booking_overrides"
 
-export function saveAvatarPersistent(dataUrl) {
-  if (typeof window === "undefined") return
+// one-time cleanup of the shared (cross-account) photo + "latest" details keys
+if (typeof window !== "undefined") {
   try {
-    if (dataUrl) localStorage.setItem(AVATAR_KEY, dataUrl)
-    else if (dataUrl === "") localStorage.removeItem(AVATAR_KEY)
+    localStorage.removeItem(LEGACY_AVATAR_KEY)
+    localStorage.removeItem("plughome:onboarding:driver:latest")
+    localStorage.removeItem("plughome:onboarding:host:latest")
   } catch {}
 }
 
-export function getSavedAvatar() {
-  if (typeof window === "undefined") return ""
+// without a user id nothing is stored or returned, so a photo can never
+// show up under a different account
+export function saveAvatarPersistent(dataUrl, userId) {
+  if (typeof window === "undefined" || !userId) return
   try {
-    return localStorage.getItem(AVATAR_KEY) || ""
+    if (dataUrl) localStorage.setItem(avatarKey(userId), dataUrl)
+    else if (dataUrl === "") localStorage.removeItem(avatarKey(userId))
+  } catch {}
+}
+
+export function getSavedAvatar(userId) {
+  if (typeof window === "undefined" || !userId) return ""
+  try {
+    return localStorage.getItem(avatarKey(userId)) || ""
   } catch {
     return ""
   }
@@ -121,10 +136,11 @@ if (shared.client?.auth && !shared.client.auth.__patched) {
   shared.client.auth.updateUser = async (attributes, options) => {
     if (attributes?.data && "photoUrl" in attributes.data) {
       const val = attributes.data.photoUrl
+      const uid = shared.user?.id
       if (val) {
-        saveAvatarPersistent(val)
+        saveAvatarPersistent(val, uid)
       } else if (val === "") {
-        saveAvatarPersistent("")
+        saveAvatarPersistent("", uid)
       }
       const isHttpUrl =
         typeof val === "string" &&
@@ -198,7 +214,7 @@ export async function uploadAvatarToBucket(userId, blobOrFile) {
     : null
 
   if (publicUrl) {
-    saveAvatarPersistent(publicUrl)
+    saveAvatarPersistent(publicUrl, cleanId)
     try {
       await supabase.auth.updateUser({
         data: { photoUrl: publicUrl, avatarUrl: publicUrl },
@@ -210,18 +226,21 @@ export async function uploadAvatarToBucket(userId, blobOrFile) {
 }
 
 export async function fetchAvatarFromBucket(userId) {
-  if (!supabase || !userId) return getSavedAvatar() || ""
+  if (!userId) return ""
+  if (!supabase) return getSavedAvatar(userId)
   const cleanId = String(userId).trim()
 
   try {
     const { data: userData } = await supabase.auth.getUser()
-    const meta = userData?.user?.user_metadata || {}
+    // only trust metadata that belongs to this exact account
+    const meta =
+      userData?.user?.id === cleanId ? userData.user.user_metadata || {} : {}
     const metaUrl = meta.avatarUrl || meta.photoUrl
     if (
       typeof metaUrl === "string" &&
       (metaUrl.startsWith("http://") || metaUrl.startsWith("https://"))
     ) {
-      saveAvatarPersistent(metaUrl)
+      saveAvatarPersistent(metaUrl, cleanId)
       return metaUrl
     }
 
@@ -243,7 +262,7 @@ export async function fetchAvatarFromBucket(userId) {
               ? new Date(found.updated_at).getTime()
               : Date.now()
             const finalUrl = `${data.publicUrl}?t=${versionTag}`
-            saveAvatarPersistent(finalUrl)
+            saveAvatarPersistent(finalUrl, cleanId)
             return finalUrl
           }
         }
@@ -251,11 +270,11 @@ export async function fetchAvatarFromBucket(userId) {
     }
   } catch {}
 
-  return getSavedAvatar() || ""
+  return getSavedAvatar(cleanId)
 }
 
 export async function removeAvatarFromBucket(userId) {
-  saveAvatarPersistent("")
+  saveAvatarPersistent("", userId)
   if (!supabase || !userId) return
   const cleanId = String(userId).trim()
   try {
@@ -280,7 +299,7 @@ export async function getToken() {
     session.user?.user_metadata?.avatarUrl ||
     session.user?.user_metadata?.photoUrl
   if (existingMetaPhoto && String(existingMetaPhoto).length > 15) {
-    saveAvatarPersistent(existingMetaPhoto)
+    saveAvatarPersistent(existingMetaPhoto, session.user?.id)
   }
 
   if (session.access_token && session.access_token.length > 3500) {
@@ -301,12 +320,12 @@ const PENDING_KEY = "plughome:pending_email_verify"
 const profileKey = (userId, role) =>
   `plughome:onboarding:${role}:${userId || "latest"}`
 
+// details are only ever read for the exact account — never another user's
 export function getSavedOnboarding(userId, role) {
+  if (!userId) return null
   try {
     const specific = localStorage.getItem(profileKey(userId, role))
-    if (specific) return JSON.parse(specific)
-    const latest = localStorage.getItem(profileKey("latest", role))
-    return latest ? JSON.parse(latest) : null
+    return specific ? JSON.parse(specific) : null
   } catch {
     return null
   }
@@ -314,12 +333,10 @@ export function getSavedOnboarding(userId, role) {
 
 // merges new onboarding/profile details into this device's saved copy
 export function saveUserOnboarding(userId, role, details) {
-  if (!role || !details || typeof details !== "object") return
+  if (!userId || !role || !details || typeof details !== "object") return
   try {
     const next = { ...(getSavedOnboarding(userId, role) || {}), ...details }
-    const json = JSON.stringify(next)
-    if (userId) localStorage.setItem(profileKey(userId, role), json)
-    localStorage.setItem(profileKey("latest", role), json)
+    localStorage.setItem(profileKey(userId, role), JSON.stringify(next))
   } catch {}
 }
 
@@ -345,12 +362,13 @@ export function clearPendingVerification() {
 
 async function finalizeSessionUser(session, fallback = {}) {
   const meta = session?.user?.user_metadata || {}
-  const bucketPhoto = await fetchAvatarFromBucket(session?.user?.id)
+  const uid = session?.user?.id
+  const bucketPhoto = await fetchAvatarFromBucket(uid)
   const resolvedPhoto =
-    bucketPhoto || meta.avatarUrl || meta.photoUrl || getSavedAvatar() || ""
+    bucketPhoto || meta.avatarUrl || meta.photoUrl || getSavedAvatar(uid) || ""
 
   if (resolvedPhoto) {
-    saveAvatarPersistent(resolvedPhoto)
+    saveAvatarPersistent(resolvedPhoto, uid)
   }
 
   const name = fallback.name || meta.name || meta.full_name || "EV User"
@@ -375,10 +393,6 @@ async function finalizeSessionUser(session, fallback = {}) {
   try {
     localStorage.setItem(
       profileKey(session.user.id, role),
-      JSON.stringify(onboarding),
-    )
-    localStorage.setItem(
-      profileKey("latest", role),
       JSON.stringify(onboarding),
     )
   } catch {}
